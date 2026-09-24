@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,6 +210,39 @@ func TestAppServiceSwitchesWorkspaceAndRestoresItsConversation(t *testing.T) {
 	}
 }
 
+func TestAppServiceSwitchesWorkspaceWithoutDroppingRuntimeProvider(t *testing.T) {
+	t.Parallel()
+	workspaceA := resolvedWorkspace(t)
+	workspaceB := resolvedWorkspace(t)
+	store := testAppStore(t)
+	config := agentapi.Config{
+		Provider: agentapi.ProviderRWKVLightningCUDA,
+		Endpoint: "https://example.test",
+		Model:    "rwkv-test",
+	}
+	provider, err := store.SaveProvider("", "Remote", config, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := agentapi.NewService(agentapi.Options{Workspace: workspaceA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := newAppService(service, store)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	bootstrap, err := backend.OpenWorkspace(workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap.Status.Workspace != workspaceB || bootstrap.Status.State != agentapi.ModelReady || bootstrap.Status.Model != config.Model {
+		t.Fatalf("workspace status = %+v", bootstrap.Status)
+	}
+	if bootstrap.RuntimeProviderID != provider.ID {
+		t.Fatalf("runtime provider = %q, want %q", bootstrap.RuntimeProviderID, provider.ID)
+	}
+}
+
 func TestParseOptionsTracksExplicitWorkspace(t *testing.T) {
 	t.Parallel()
 	implicit, err := parseOptions(nil)
@@ -315,5 +350,124 @@ func TestPersistTurnKeepsFailedRunTrace(t *testing.T) {
 	}
 	if len(reloaded.Messages) != 2 || reloaded.Messages[1].Trace == nil || reloaded.Messages[1].Trace.Error != result.Error {
 		t.Fatalf("reloaded failed message = %+v", reloaded.Messages)
+	}
+}
+
+func TestPersistResponseCreatesSelectableSiblingBranches(t *testing.T) {
+	t.Parallel()
+	workspace := resolvedWorkspace(t)
+	store := testAppStore(t)
+	service, err := agentapi.NewService(agentapi.Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := newAppService(service, store)
+	t.Cleanup(func() { _ = backend.Close() })
+
+	if err := backend.persistTurn(nil, "解释架构", "assistant", "第一个回答", agentapi.Result{}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	firstUserID := backend.active.Messages[0].ID
+	firstResponseID := backend.active.Messages[1].ID
+	backend.mu.Unlock()
+	if err := backend.persistResponse(nil, "解释架构", "assistant", "第二个回答", agentapi.Result{}, time.Now().UTC(), firstUserID); err != nil {
+		t.Fatal(err)
+	}
+
+	backend.mu.Lock()
+	active := *backend.active
+	backend.mu.Unlock()
+	if len(active.Messages) != 3 || active.Messages[2].ParentID != firstUserID || active.ActiveLeafID != active.Messages[2].ID {
+		t.Fatalf("branched conversation = %+v", active)
+	}
+	view, err := backend.SelectBranch(firstResponseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.ActiveLeafID != firstResponseID || len(view.Messages) != 3 {
+		t.Fatalf("selected branch view = %+v", view)
+	}
+}
+
+func TestEditMessageCreatesSiblingUserBranch(t *testing.T) {
+	t.Parallel()
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requestCount++
+		content := "旧回答"
+		if requestCount > 1 {
+			content = "新回答"
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"` + content + `"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	workspace := resolvedWorkspace(t)
+	store := testAppStore(t)
+	service, err := agentapi.NewService(agentapi.Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := newAppService(service, store)
+	t.Cleanup(func() { _ = backend.Close() })
+	stream := false
+	if _, err := backend.ConfigureProvider(t.Context(), "", "Test", agentapi.Config{
+		Provider: agentapi.ProviderRWKVLightningCUDA,
+		Endpoint: server.URL + "/v1/chat/completions",
+		Model:    "test-model",
+		Stream:   &stream,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.Chat(t.Context(), "解释旧架构"); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	userID := backend.active.Messages[0].ID
+	backend.mu.Unlock()
+	if _, err := backend.EditMessage(t.Context(), userID, "解释新架构"); err != nil {
+		t.Fatal(err)
+	}
+
+	bootstrap, err := backend.Bootstrap()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bootstrap.Conversation == nil || len(bootstrap.Conversation.Messages) != 4 {
+		t.Fatalf("edited conversation = %+v", bootstrap.Conversation)
+	}
+	messages := bootstrap.Conversation.Messages
+	if messages[2].Role != "user" || messages[2].Content != "解释新架构" || messages[2].ParentID != messages[0].ParentID {
+		t.Fatalf("edited user branch = %+v", messages[2])
+	}
+	if messages[3].ParentID != messages[2].ID || messages[3].Content != "新回答" || bootstrap.Conversation.ActiveLeafID != messages[3].ID {
+		t.Fatalf("edited answer branch = %+v", messages[3])
+	}
+}
+
+func TestBranchTranscriptRebuildsSelectedPathFromSegments(t *testing.T) {
+	t.Parallel()
+	conversation := appstorage.Conversation{
+		Messages: []appstorage.DisplayMessage{
+			{ID: "u1", Role: "user", Content: "first"},
+			{ID: "a1", ParentID: "u1", Role: "assistant", Content: "one"},
+			{ID: "u2", ParentID: "a1", Role: "user", Content: "second"},
+			{ID: "a2", ParentID: "u2", Role: "assistant", Content: "two"},
+			{ID: "a3", ParentID: "u2", Role: "assistant", Content: "alternate"},
+		},
+		BranchSegments: map[string][]agentapi.ConversationMessage{
+			"a1": {{Role: "user", Content: "first"}, {Role: "assistant", Content: "one"}},
+			"a2": {{Role: "user", Content: "second"}, {Role: "assistant", Content: "two"}},
+			"a3": {{Role: "user", Content: "second"}, {Role: "assistant", Content: "alternate"}},
+		},
+	}
+	history, err := branchTranscript(conversation, "a3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 4 || history[1].Content != "one" || history[3].Content != "alternate" {
+		t.Fatalf("branch history = %+v", history)
 	}
 }

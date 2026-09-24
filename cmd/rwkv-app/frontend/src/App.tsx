@@ -1,10 +1,10 @@
 import { KeyboardEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
-  ChevronDown, Folder, FolderOpen, LoaderCircle,
-  Menu, MoreHorizontal, PenLine, Pin, Settings, SquarePen,
-  Trash2, X,
+  ChevronDown, ChevronLeft, ChevronRight, Copy, Folder, FolderOpen, LoaderCircle,
+  Menu, MoreHorizontal, Pencil, PenLine, Pin, RefreshCw, Route, Settings,
+  SquarePen, Trash2, X,
 } from 'lucide-react'
-import { Events } from '@wailsio/runtime'
+import { Clipboard, Events } from '@wailsio/runtime'
 import * as Backend from '../bindings/github.com/no22/RWKV-Agent/cmd/rwkv-app/appservice'
 import { ModelState, Status, type Result, type Step } from '../bindings/github.com/no22/RWKV-Agent/api/models'
 import type {
@@ -18,11 +18,13 @@ import SettingsPage from './components/SettingsPage'
 import SubagentCards from './components/SubagentCards'
 import TraceView from './components/TraceView'
 import { buildTraceTurns, flattenTraceRecords, formatDuration, parseJSONValue, shortValue, traceStats, type TraceRecord } from './ledger'
+import { useSnackbar } from './snackbar'
 import { useProviderManager } from './state/providerManager'
 import { getInitialTheme, toggleTheme, type ThemeMode } from './theme'
 
 type Message = {
   id: string
+  parentId?: string
   role: 'user' | 'assistant' | 'error'
   content: string
   prompt?: string
@@ -36,7 +38,8 @@ type AgentActivity = {
   bundles?: string[]; subagentIndex?: number; subagentTask?: string; durationMs?: number
   attempt?: number; maxAttempts?: number; statusCode?: number; delayMs?: number; error?: string
 }
-type ChatTurn = { user?: Message; response?: Message }
+type UserBranch = { user: Message; responseID: string }
+type ChatTurn = { user?: Message; response?: Message; responses?: Message[]; userBranches?: UserBranch[] }
 type GutterStatus = { label: string; state: 'idle' | 'running' | 'completed' | 'failed' }
 type LedgerEvent = {
   id: string
@@ -61,9 +64,12 @@ export default function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([])
   const [workspaces, setWorkspaces] = useState<WorkspaceItem[]>([])
   const [activeConversationID, setActiveConversationID] = useState('')
+  const [activeLeafID, setActiveLeafID] = useState('')
   const [activity, setActivity] = useState<AgentActivity[]>([])
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
+  const [regeneratingResponseID, setRegeneratingResponseID] = useState('')
+  const [editingMessageID, setEditingMessageID] = useState('')
   const [activeTab, setActiveTab] = useState<'chat' | 'trace'>('chat')
   const [selectedTraceID, setSelectedTraceID] = useState('')
   const [runConfigOpen, setRunConfigOpen] = useState(false)
@@ -120,6 +126,14 @@ export default function App() {
     manager.applyProviderBootstrapState(value)
     applyConversation(value.conversation || undefined); if (value.hasConfig) manager.applyConfig(value.config); if (value.warning) manager.setSettingsMessage(value.warning)
   }
+  function applyWorkspaceBootstrap(value: AppBootstrap) {
+    applyBootstrap(value)
+    if (value.status.state === ModelState.ModelReady) return
+    manager.openSettings()
+    manager.setSettingsMessage((value.providers || []).length > 0
+      ? '当前没有运行连接，请选择一个已保存连接并点击“使用”。'
+      : '当前没有可用连接，请先创建连接并点击“保存并使用”。')
+  }
   async function activateProviderNow(id: string) {
     if (busy) return
     setRunConfigOpen(false); setBusy(true)
@@ -131,12 +145,12 @@ export default function App() {
     try { await manager.deleteProvider(id) } catch (error) { manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) }
   }
   function applyConversation(value?: ConversationView) {
-    setActiveConversationID(value?.id || ''); setActiveTab('chat'); setActivity([]); setPrompt('')
+    setActiveConversationID(value?.id || ''); setActiveLeafID(value?.activeLeafId || ''); setActiveTab('chat'); setActivity([]); setPrompt('')
     let lastPrompt = ''
     setMessages((value?.messages || []).map((message) => {
       if (message.role === 'user') lastPrompt = message.content
       return {
-        id: message.id, role: message.role as Message['role'], content: message.content,
+        id: message.id, parentId: message.parentId, role: message.role as Message['role'], content: message.content,
         prompt: message.role !== 'user' ? lastPrompt : undefined, meta: message.meta,
         trajectory: message.trajectory as ToolTrace[] | undefined,
         trace: message.trace as Result | undefined, createdAt: normalizeTimestamp(message.createdAt),
@@ -146,12 +160,15 @@ export default function App() {
   async function sendMessage(value: string) {
     const content = value.trim(); if (!content || busy) return
     if (!ready) { manager.openSettings(); manager.setSettingsMessage('请先选择一个已保存连接，或新建草稿后点击“保存并使用”。'); return }
-    setPrompt(''); setActivity([]); setMessages((current) => [...current, { id: `pending-${nextMessageID++}`, role: 'user', content, createdAt: new Date().toISOString() }]); setBusy(true)
+    const pendingUserID = `pending-${nextMessageID++}`
+    setPrompt(''); setActivity([]); setMessages((current) => [...current, { id: pendingUserID, parentId: activeLeafID, role: 'user', content, createdAt: new Date().toISOString() }]); setActiveLeafID(pendingUserID); setBusy(true)
     try {
       const result = await Backend.Chat(content)
-      const assistant: Message = { id: `pending-${nextMessageID++}`, role: 'assistant', content: result.output, prompt: content, trace: result, createdAt: new Date().toISOString(), meta: `${result.steps.length} 步 · ${(result.durationMs / 1000).toFixed(1)} 秒`, trajectory: legacyTrajectory(result.steps) }
-      setMessages((current) => [...current, assistant]); setSelectedTraceID(assistant.id)
-      const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); setActiveConversationID(persisted.conversation?.id || '')
+      const assistant: Message = { id: `pending-${nextMessageID++}`, parentId: pendingUserID, role: 'assistant', content: result.output, prompt: content, trace: result, createdAt: new Date().toISOString(), meta: `${result.steps.length} 步 · ${(result.durationMs / 1000).toFixed(1)} 秒`, trajectory: legacyTrajectory(result.steps) }
+      setMessages((current) => [...current, assistant]); setActiveLeafID(assistant.id); setSelectedTraceID(assistant.id)
+      const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || [])
+      if (persisted.conversation) applyConversation(persisted.conversation)
+      else setActiveConversationID('')
     } catch (error) {
       try {
         const persisted = await Backend.Bootstrap()
@@ -164,13 +181,41 @@ export default function App() {
     finally { setBusy(false) }
   }
   function submitMessage() { void sendMessage(prompt) }
-  function regenerate(value: string) { void sendMessage(value) }
+  async function regenerate(responseID: string) {
+    if (busy || !ready) return
+    setActivity([]); setRegeneratingResponseID(responseID); setBusy(true)
+    try {
+      await Backend.Regenerate(responseID)
+      const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); applyConversation(persisted.conversation || undefined)
+    } catch (error) {
+      try { const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); applyConversation(persisted.conversation || undefined) }
+      catch { manager.setSettingsMessage(errorText(error)) }
+    } finally { setRegeneratingResponseID(''); setBusy(false) }
+  }
+  async function editMessage(userID: string, content: string) {
+    if (busy || !ready || !content.trim()) return
+    setActivity([]); setEditingMessageID(userID); setBusy(true)
+    try {
+      await Backend.EditMessage(userID, content.trim())
+      const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); applyConversation(persisted.conversation || undefined)
+    } catch (error) {
+      try { const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); applyConversation(persisted.conversation || undefined) }
+      catch { manager.setSettingsMessage(errorText(error)) }
+    } finally { setEditingMessageID(''); setBusy(false) }
+  }
+  async function selectBranch(responseID: string) {
+    if (busy || responseID === activeLeafID) return
+    setBusy(true)
+    try { applyConversation(await Backend.SelectBranch(responseID)) }
+    catch (error) { manager.setSettingsMessage(errorText(error)) }
+    finally { setBusy(false) }
+  }
   function onComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(prompt) } }
-  async function newConversation() { if (busy) return; await Backend.NewConversation(); setMessages([]); setActivity([]); setPrompt(''); setActiveConversationID(''); setActiveTab('chat') }
+  async function newConversation() { if (busy) return; await Backend.NewConversation(); setMessages([]); setActivity([]); setPrompt(''); setActiveConversationID(''); setActiveLeafID(''); setActiveTab('chat') }
   async function openConversation(id: string) { if (busy || id === activeConversationID) return; setBusy(true); try { applyConversation(await Backend.OpenConversation(id)) } catch (error) { manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) } }
   async function deleteConversation(id: string) { if (busy) return; setBusy(true); try { await Backend.DeleteConversation(id); if (id === activeConversationID) applyConversation(); const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []) } catch (error) { manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) } }
-  async function chooseWorkspace() { if (busy) return; setBusy(true); try { applyBootstrap(await Backend.ChooseWorkspace()) } catch (error) { if (!errorText(error).toLowerCase().includes('cancel')) manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) } }
-  async function openWorkspace(path: string) { if (busy) return; setBusy(true); try { applyBootstrap(await Backend.OpenWorkspace(path)) } catch (error) { manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) } }
+  async function chooseWorkspace() { if (busy) return; setBusy(true); try { applyWorkspaceBootstrap(await Backend.ChooseWorkspace()) } catch (error) { if (!errorText(error).toLowerCase().includes('cancel')) manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) } }
+  async function openWorkspace(path: string) { if (busy) return; setBusy(true); try { applyWorkspaceBootstrap(await Backend.OpenWorkspace(path)) } catch (error) { manager.setSettingsMessage(errorText(error)) } finally { setBusy(false) } }
   async function renameConversation(id: string, title: string) {
     try { await Backend.RenameConversation(id, title); const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []) } catch (error) { manager.setSettingsMessage(errorText(error)) }
   }
@@ -178,9 +223,10 @@ export default function App() {
     try { await Backend.SetConversationPinned(id, pinned); const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []) } catch (error) { manager.setSettingsMessage(errorText(error)) }
   }
 
-  const traceMessages = messages.filter((message) => message.role !== 'user' && (message.trace || message.trajectory?.length))
+  const visibleMessages = useMemo(() => activeMessagePath(messages, activeLeafID), [messages, activeLeafID])
+  const traceMessages = visibleMessages.filter((message) => message.role !== 'user' && (message.trace || message.trajectory?.length))
   const selectedMessage = traceMessages.find((message) => message.id === selectedTraceID) || traceMessages.at(-1)
-  const turns = groupMessagesIntoTurns(messages)
+  const turns = groupMessagesIntoTurns(visibleMessages, messages)
 
   return <div className="flex h-full w-full bg-paper">
     {settingsOpen ? <SettingsPage manager={manager} status={status} ready={ready} onChooseWorkspace={chooseWorkspace} theme={theme} onToggleTheme={handleToggleTheme} onActivateProvider={(id) => void activateProviderNow(id)} onDeleteProvider={(id) => void deleteProviderNow(id)} /> : <>
@@ -202,7 +248,7 @@ export default function App() {
             </button>
           </div>
         </header>
-        {activeTab === 'trace' ? <TraceView messages={traceMessages} selected={selectedMessage} onSelect={setSelectedTraceID} onBackToChat={() => setActiveTab('chat')} /> : <ChatView messages={messages} activity={activity} busy={busy} ready={ready} workspace={workspaceName} model={status.model || '选择模型'} capabilities={capabilities} prompt={prompt} setPrompt={setPrompt} onSubmit={submitMessage} onRegenerate={regenerate} onKeyDown={onComposerKeyDown} openSettings={manager.openSettings} chooseWorkspace={chooseWorkspace} onTrace={(id) => { setSelectedTraceID(id); setActiveTab('trace') }} messagesEnd={messagesEnd} />}
+        {activeTab === 'trace' ? <TraceView messages={traceMessages} selected={selectedMessage} onSelect={setSelectedTraceID} onBackToChat={() => setActiveTab('chat')} /> : <ChatView messages={messages} activeLeafID={activeLeafID} activity={activity} busy={busy} regeneratingResponseID={regeneratingResponseID} editingMessageID={editingMessageID} ready={ready} workspace={workspaceName} model={status.model || '选择模型'} capabilities={capabilities} prompt={prompt} setPrompt={setPrompt} onSubmit={submitMessage} onEditMessage={editMessage} onRegenerate={regenerate} onSelectBranch={selectBranch} onKeyDown={onComposerKeyDown} openSettings={manager.openSettings} chooseWorkspace={chooseWorkspace} onTrace={(id) => { setSelectedTraceID(id); setActiveTab('trace') }} messagesEnd={messagesEnd} />}
       </main>
       <RunConfigDropdown open={runConfigOpen} onClose={() => setRunConfigOpen(false)} ready={ready} busy={busy} providers={manager.providers} runtimeProviderId={manager.runtimeProviderId} onActivate={(id) => void activateProviderNow(id)} onOpenSettings={() => { setRunConfigOpen(false); manager.openSettings() }} />
     </>}
@@ -281,8 +327,8 @@ function Sidebar({ conversations, workspaces, activeId, busy, open, onCloseSideb
   </>
 }
 
-function ChatView({ messages, activity, busy, ready, workspace, capabilities, prompt, setPrompt, onSubmit, onRegenerate, onKeyDown, onTrace, messagesEnd }: { messages: Message[]; activity: AgentActivity[]; busy: boolean; ready: boolean; workspace: string; model: string; capabilities: string; prompt: string; setPrompt: (value: string) => void; onSubmit: () => void; onRegenerate: (value: string) => void; onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void; openSettings: () => void; chooseWorkspace: () => Promise<void>; onTrace: (id: string) => void; messagesEnd: React.RefObject<HTMLDivElement | null> }) {
-  const turns = groupMessagesIntoTurns(messages)
+function ChatView({ messages, activeLeafID, activity, busy, regeneratingResponseID, editingMessageID, ready, workspace, capabilities, prompt, setPrompt, onSubmit, onEditMessage, onRegenerate, onSelectBranch, onKeyDown, onTrace, messagesEnd }: { messages: Message[]; activeLeafID: string; activity: AgentActivity[]; busy: boolean; regeneratingResponseID: string; editingMessageID: string; ready: boolean; workspace: string; model: string; capabilities: string; prompt: string; setPrompt: (value: string) => void; onSubmit: () => void; onEditMessage: (userID: string, content: string) => void; onRegenerate: (responseID: string) => void; onSelectBranch: (responseID: string) => void; onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void; openSettings: () => void; chooseWorkspace: () => Promise<void>; onTrace: (id: string) => void; messagesEnd: React.RefObject<HTMLDivElement | null> }) {
+  const turns = groupMessagesIntoTurns(activeMessagePath(messages, activeLeafID), messages)
   const empty = turns.length === 0
   const stageRef = useRef<HTMLDivElement>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -335,7 +381,7 @@ function ChatView({ messages, activity, busy, ready, workspace, capabilities, pr
   return <div className="chat-panel relative flex min-h-0 flex-1 flex-col overflow-hidden">
     <div ref={stageRef} className="chat-stage relative min-h-0 flex-1 overflow-hidden">
       {!empty && <div ref={scrollRef} className="conversation-scroll absolute inset-0 mx-auto content-narrow overflow-auto pt-[30px]">
-        {turns.map((turn, index) => <TurnView key={turn.user?.id || turn.response?.id || index} turn={turn} index={index + 1} pending={busy && index === turns.length - 1 && !turn.response} activity={activity} onTrace={onTrace} onRegenerate={onRegenerate} />)}
+        {turns.map((turn, index) => <TurnView key={turn.user?.id || turn.response?.id || index} turn={turn} index={index + 1} busy={busy} pending={busy && index === turns.length - 1 && !turn.response} regenerating={turn.response?.id === regeneratingResponseID} editingBranch={turn.user?.id === editingMessageID} activity={activity} onTrace={onTrace} onEditMessage={onEditMessage} onRegenerate={onRegenerate} onSelectBranch={onSelectBranch} />)}
         <div ref={messagesEnd} />
       </div>}
     </div>
@@ -345,39 +391,106 @@ function ChatView({ messages, activity, busy, ready, workspace, capabilities, pr
   </div>
 }
 
-function TurnView({ turn, index, pending, activity, onTrace, onRegenerate }: { turn: ChatTurn; index: number; pending: boolean; activity: AgentActivity[]; onTrace: (id: string) => void; onRegenerate: (value: string) => void }) {
+function TurnView({ turn, index, busy, pending, regenerating, editingBranch, activity, onTrace, onEditMessage, onRegenerate, onSelectBranch }: { turn: ChatTurn; index: number; busy: boolean; pending: boolean; regenerating: boolean; editingBranch: boolean; activity: AgentActivity[]; onTrace: (id: string) => void; onEditMessage: (userID: string, content: string) => void; onRegenerate: (responseID: string) => void; onSelectBranch: (responseID: string) => void }) {
+  const [editing, setEditing] = useState(false)
+  const [editValue, setEditValue] = useState(turn.user?.content || '')
+  const [userActionsOpen, setUserActionsOpen] = useState(false)
+  const { show } = useSnackbar()
   const response = turn.response
+  const responses = turn.responses || (response ? [response] : [])
+  const branchIndex = response ? responses.findIndex((candidate) => candidate.id === response.id) : -1
+  const userBranches = turn.userBranches || []
+  const userBranchIndex = turn.user ? userBranches.findIndex((branch) => branch.user.id === turn.user?.id) : -1
   const hasTrace = Boolean(response?.trace || response?.trajectory?.length)
   const subagentCalls = (response?.trajectory || []).filter((call) => call.subagents?.length)
   const subagentCount = subagentCalls.reduce((sum, call) => sum + (call.subagents?.length || 0), 0)
-  const statuses = pending ? liveGutterStatuses(activity) : completedGutterStatuses(response)
+  const running = pending || regenerating || editingBranch
+  const statuses = running
+    ? (activity.length === 0
+        ? [{ label: editingBranch ? '正在生成编辑后的回答' : regenerating ? '正在重新生成' : '正在思考', state: 'running' as const }]
+        : liveGutterStatuses(activity))
+    : completedGutterStatuses(response)
   const stats = response?.trace ? traceStats(response.trace) : undefined
   const time = turn.user?.createdAt || response?.createdAt
-  return <article className={`conversation-turn mb-[42px] grid turn-grid${pending ? ' pending' : ''}`} data-testid={`conversation-turn-${index}`}>
+  function submitEdit() {
+    if (!turn.user || busy || !editValue.trim()) return
+    onEditMessage(turn.user.id, editValue)
+  }
+  async function copyText(content: string) {
+    try {
+      if ((window as typeof window & { _wails?: unknown })._wails) {
+        await Clipboard.SetText(content)
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(content)
+      } else if (!fallbackCopyText(content)) {
+        throw new Error('Clipboard unavailable')
+      }
+      show('已复制', 'success')
+    } catch {
+      show('复制失败', 'error')
+    }
+  }
+  return <article className={`conversation-turn mb-[42px] grid turn-grid${running ? ' pending' : ''}`} data-testid={`conversation-turn-${index}`}>
     <aside className="turn-gutter flex min-w-0 flex-col items-end gap-[6px] pt-[1px] text-right text-ink-muted">
       <span className={`font-serif text-xl font-bold leading-none ${response?.role === 'error' ? 'text-danger' : 'text-ink-faint'}`}>{String(index).padStart(2, '0')}</span>
       <time className="text-2xs leading-[1.6]">{formatTurnTime(time)}</time>
       <span className="my-[3px] h-px w-[34px] flex-none bg-line" />
-      <div className="gutter-statuses flex w-full flex-col items-end gap-1" aria-label={pending ? 'Agent 运行状态' : 'Agent 完成状态'}>
+      <div className="gutter-statuses flex w-full flex-col items-end gap-1" aria-label={running ? 'Agent 运行状态' : 'Agent 完成状态'}>
         {statuses.map((item, statusIndex) => <div className={`gutter-status flex w-full items-center justify-end gap-[7px] text-2xs leading-[1.55] ${item.state === 'failed' ? 'failed text-danger' : item.state === 'running' ? 'running text-brand' : item.state === 'completed' ? 'completed text-ink-soft' : 'text-ink-soft'}`} key={`${item.label}-${statusIndex}`}><span className="min-w-0 truncate">{item.label}</span><i /></div>)}
       </div>
       {subagentCount > 0 && <div className="mt-[2px] flex items-start gap-[7px] text-2xs leading-[1.5] text-ink-ghost"><span>{subagentCount} 路并发<br />见右侧</span><svg width="11" height="26" viewBox="0 0 11 26" fill="none" stroke="var(--brand)" strokeWidth="1.2" className="flex-none"><path d="M5.5 0v6M5.5 6c0 4 4.5 3 4.5 7v13M5.5 6c0 4-4.5 3-4.5 7v13M5.5 6v20" /></svg></div>}
       {(stats || (response?.trajectory?.length && !response.trace)) && <><span className="my-[3px] h-px w-[34px] flex-none bg-line" /><span className="text-2xs leading-[1.6] text-ink-muted">{stats ? <>{formatDuration(stats.durationMs)}{stats.tokens > 0 && <><br />{stats.tokens.toLocaleString('zh-CN')} tok</>}</> : <>历史摘要<br />工具 {response?.trajectory?.length}</>}</span></>}
     </aside>
     <div className="turn-main flex min-w-0 flex-col gap-4">
-      {turn.user && <div className="flex justify-end"><div className="min-w-[180px] max-w-[82%] border-l-2 border-user-line bg-user-bg p-[11px_15px] text-base leading-[1.7] text-user-text [overflow-wrap:anywhere]">{turn.user.content}</div></div>}
+      {turn.user && <div className="group flex flex-col items-end gap-2" onClick={() => setUserActionsOpen(true)}>
+        {editing ? <div className="flex w-[82%] min-w-[260px] flex-col gap-3 border-l-2 border-user-line bg-user-bg p-[11px_15px]">
+          <textarea autoFocus aria-label="编辑用户消息" rows={Math.max(2, editValue.split('\n').length)} value={editValue} disabled={editingBranch} className="max-h-[240px] min-h-[70px] w-full resize-y border-0 bg-transparent p-0 text-base leading-[1.7] text-user-text outline-none" onChange={(event) => setEditValue(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape' && !editingBranch) setEditing(false); if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) { event.preventDefault(); submitEdit() } }} />
+          <div className="flex justify-end gap-2">
+            <button className="h-8 border border-line bg-paper px-3 text-sm text-ink-soft disabled:opacity-50" disabled={editingBranch} onClick={() => setEditing(false)}>取消</button>
+            <button className="flex h-8 items-center gap-2 border-0 bg-brand px-3 text-sm font-medium text-white disabled:opacity-50" aria-label="发送编辑" disabled={editingBranch || !editValue.trim()} onClick={submitEdit}>{editingBranch && <LoaderCircle size={14} className="spin" />}{editingBranch ? '发送中…' : '发送'}</button>
+          </div>
+        </div> : <div className="min-w-[180px] max-w-[82%] border-l-2 border-user-line bg-user-bg p-[11px_15px] text-base leading-[1.7] text-user-text [overflow-wrap:anywhere]">{turn.user.content}</div>}
+        {!editing && <div className={`flex items-center justify-end gap-1 text-ink-muted transition-opacity ${userActionsOpen ? 'opacity-100' : 'pointer-events-none opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100'}`} aria-label="用户消息操作">
+          {userBranches.length > 1 && <div className="mr-1 flex items-center gap-1 text-xs text-ink-muted" aria-label="用户消息分支">
+            <button className="grid h-6 w-6 place-items-center border-0 bg-transparent p-0 hover:text-brand disabled:opacity-30" aria-label="上一个用户消息分支" disabled={busy || userBranchIndex <= 0} onClick={() => onSelectBranch(userBranches[userBranchIndex - 1].responseID)}><ChevronLeft size={14} /></button>
+            <span className="min-w-[34px] text-center font-mono text-2xs">{userBranchIndex + 1} / {userBranches.length}</span>
+            <button className="grid h-6 w-6 place-items-center border-0 bg-transparent p-0 hover:text-brand disabled:opacity-30" aria-label="下一个用户消息分支" disabled={busy || userBranchIndex < 0 || userBranchIndex >= userBranches.length - 1} onClick={() => onSelectBranch(userBranches[userBranchIndex + 1].responseID)}><ChevronRight size={14} /></button>
+          </div>}
+          <button className="grid h-7 w-7 place-items-center rounded-[3px] border-0 bg-transparent p-0 hover:bg-surface-active hover:text-brand" aria-label="复制用户消息" title="复制" onClick={() => void copyText(turn.user?.content || '')}><Copy size={14} /></button>
+          <button className="grid h-7 w-7 place-items-center rounded-[3px] border-0 bg-transparent p-0 hover:bg-surface-active hover:text-brand disabled:opacity-40" aria-label="编辑用户消息" title="编辑" disabled={busy} onClick={() => { setEditValue(turn.user?.content || ''); setEditing(true) }}><Pencil size={14} /></button>
+        </div>}
+      </div>}
       {pending && <div className="turn-pending-answer min-h-7 pt-[2px]" aria-live="polite"><span className="answer-cursor" /><span className="sr-only">{activityLabel(activity.at(-1))}</span></div>}
       {response?.role === 'assistant' && <div className="turn-answer font-serif text-md leading-[1.95] text-ink [overflow-wrap:anywhere]"><MarkdownMessage content={response.content} /></div>}
       {response?.role === 'error' && <div className="flex items-start gap-2 border-l-2 border-danger bg-danger-wash p-[10px_12px] text-sm leading-[1.65] text-danger"><X size={15} className="mt-[3px] flex-none" /><span>{response.content}</span></div>}
+      {editingBranch && <div className="flex items-center gap-2 text-xs text-brand" aria-live="polite"><LoaderCircle size={14} className="spin" /><span>正在生成编辑后的回答…</span></div>}
       {subagentCount > 0 && response && <SubagentCards trajectory={response.trajectory} done={!pending} />}
-      {response?.meta && <div className="font-mono text-2xs text-ink-muted">{response.meta}</div>}
-      {response && <div className="turn-actions flex gap-4 pt-[2px]">
-        {response.role === 'assistant' && <button className="border-0 bg-transparent p-0 text-xs text-ink-muted hover:text-brand" onClick={() => void navigator.clipboard?.writeText(response.content)}>复制</button>}
-        {response.role === 'assistant' && turn.user && <button className="border-0 bg-transparent p-0 text-xs text-ink-muted hover:text-brand" onClick={() => onRegenerate(turn.user?.content || '')}>重新生成</button>}
-        {hasTrace && <button className="border-0 bg-transparent p-0 text-xs text-ink-muted hover:text-brand" onClick={() => onTrace(response.id)}>查看轨迹</button>}
+      {response && <div className="turn-actions flex items-center gap-1 pt-[2px]">
+        {responses.length > 1 && <div className="mr-1 flex items-center gap-1 text-xs text-ink-muted" aria-label="消息分支">
+          <button className="grid h-5 w-5 place-items-center border-0 bg-transparent p-0 hover:text-brand disabled:opacity-30" aria-label="上一个分支" disabled={branchIndex <= 0} onClick={() => onSelectBranch(responses[branchIndex - 1].id)}><ChevronLeft size={14} /></button>
+          <span className="min-w-[34px] text-center font-mono text-2xs">{branchIndex + 1} / {responses.length}</span>
+          <button className="grid h-5 w-5 place-items-center border-0 bg-transparent p-0 hover:text-brand disabled:opacity-30" aria-label="下一个分支" disabled={branchIndex < 0 || branchIndex >= responses.length - 1} onClick={() => onSelectBranch(responses[branchIndex + 1].id)}><ChevronRight size={14} /></button>
+        </div>}
+        {response.role === 'assistant' && <button className="grid h-7 w-7 place-items-center rounded-[3px] border-0 bg-transparent p-0 text-ink-muted hover:bg-surface-active hover:text-brand" aria-label="复制回答" title="复制" onClick={() => void copyText(response.content)}><Copy size={14} /></button>}
+        {response.role === 'assistant' && turn.user && <button className="grid h-7 w-7 place-items-center rounded-[3px] border-0 bg-transparent p-0 text-ink-muted hover:bg-surface-active hover:text-brand disabled:opacity-50" aria-label="重新生成" title="重新生成" disabled={regenerating} onClick={() => onRegenerate(response.id)}><RefreshCw size={14} className={regenerating ? 'spin' : undefined} /></button>}
+        {hasTrace && <button className="grid h-7 w-7 place-items-center rounded-[3px] border-0 bg-transparent p-0 text-ink-muted hover:bg-surface-active hover:text-brand" aria-label="查看轨迹" title="查看轨迹" onClick={() => onTrace(response.id)}><Route size={14} /></button>}
+        {response.meta && <span className="ml-auto font-mono text-2xs text-ink-muted">{response.meta}</span>}
       </div>}
     </div>
   </article>
+}
+
+function fallbackCopyText(content: string) {
+  const textarea = document.createElement('textarea')
+  textarea.value = content
+  textarea.readOnly = true
+  textarea.style.position = 'fixed'
+  textarea.style.top = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  return copied
 }
 
 function Composer({ prompt, setPrompt, busy, ready, workspace, capabilities, empty, onSubmit, onKeyDown }: { prompt: string; setPrompt: (value: string) => void; busy: boolean; ready: boolean; workspace: string; capabilities: string; empty?: boolean; onSubmit: () => void; onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void }) {
@@ -461,15 +574,42 @@ function legacyTrajectory(steps: Step[]): ToolTrace[] {
   }))
 }
 
-function groupMessagesIntoTurns(messages: Message[]) {
+function activeMessagePath(messages: Message[], activeLeafID: string) {
+  if (!messages.length) return []
+  if (!messages.some((message) => message.parentId)) return messages
+  const byID = new Map(messages.map((message) => [message.id, message]))
+  const path: Message[] = []
+  let current = byID.get(activeLeafID) || messages.at(-1)
+  const visited = new Set<string>()
+  while (current && !visited.has(current.id)) {
+    path.unshift(current)
+    visited.add(current.id)
+    current = current.parentId ? byID.get(current.parentId) : undefined
+  }
+  return path
+}
+
+function groupMessagesIntoTurns(messages: Message[], allMessages: Message[] = messages) {
   const turns: ChatTurn[] = []
   for (const message of messages) {
     if (message.role === 'user') {
-      turns.push({ user: message })
+      const userBranches = allMessages
+        .filter((candidate) => candidate.role === 'user' && candidate.parentId === message.parentId)
+        .map((user) => {
+          const response = allMessages.filter((candidate) => candidate.role !== 'user' && candidate.parentId === user.id).at(-1)
+          return response ? { user, responseID: response.id } : undefined
+        })
+        .filter((branch): branch is UserBranch => Boolean(branch))
+      turns.push({ user: message, userBranches })
       continue
     }
     const current = turns.at(-1)
-    if (current && !current.response) current.response = message
+    if (current && !current.response) {
+      current.response = message
+      current.responses = current.user
+        ? allMessages.filter((candidate) => candidate.role !== 'user' && candidate.parentId === current.user?.id)
+        : [message]
+    }
     else turns.push({ response: message })
   }
   return turns

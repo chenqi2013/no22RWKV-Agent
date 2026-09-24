@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { MoreHorizontal, Plus, Trash2 } from 'lucide-react'
+import { MoreHorizontal, Play, Plus, Trash2 } from 'lucide-react'
 import { Provider } from '../../../bindings/github.com/no22/RWKV-Agent/api/models'
 import type { SavedProvider } from '../../../bindings/github.com/no22/RWKV-Agent/internal/appstorage/models'
 import type { ProviderManager } from '../../state/providerManager'
@@ -151,18 +151,17 @@ function ProviderRow({ provider, running, selected, dirty, menuOpen, onToggleMen
         </span>
       </button>
       <div className="flex flex-none items-center gap-[2px]">
-        {!running && (
-          <button className="h-[24px] border border-line bg-paper-wash px-[8px] text-xs text-ink-soft opacity-0 transition-opacity hover:border-brand hover:text-brand focus-visible:opacity-100 group-hover:opacity-100" onClick={onUse} title="切换为此连接">使用</button>
-        )}
-        <button className="grid h-[24px] w-[24px] place-items-center border-0 bg-transparent text-ink-muted opacity-0 transition-opacity hover:text-ink focus-visible:opacity-100 group-hover:opacity-100" aria-label={`更多操作 ${provider.label || ''}`} onClick={onToggleMenu}><MoreHorizontal size={14} /></button>
+        <button className="grid h-[24px] w-[24px] place-items-center border-0 bg-transparent text-ink-muted opacity-0 transition-opacity hover:text-ink focus-visible:opacity-100 group-hover:opacity-100" aria-label={`更多操作 ${provider.label || ''}`} aria-expanded={menuOpen} aria-haspopup="menu" onClick={onToggleMenu}><MoreHorizontal size={14} /></button>
       </div>
       {menuOpen && (
         <>
           <div className="fixed inset-0 z-[10]" onClick={onCloseMenu} aria-hidden="true" />
-          <button className="absolute right-[6px] top-[30px] z-[20] flex items-center gap-[7px] border border-line-strong bg-paper-wash px-[10px] py-[7px] text-xs text-danger shadow-[0_8px_20px_rgba(45,33,20,.12)]" onClick={onDelete}><Trash2 size={13} />删除连接</button>
+          <div className="absolute right-[6px] top-[30px] z-[20] min-w-[116px] border border-line-strong bg-paper-wash py-[4px] shadow-[0_8px_20px_rgba(45,33,20,.12)]" role="menu">
+            {!running && <button className="flex w-full items-center gap-[7px] border-0 bg-transparent px-[10px] py-[7px] text-left text-xs text-ink hover:bg-surface-active hover:text-brand" role="menuitem" onClick={onUse}><Play size={13} />使用</button>}
+            <button className="flex w-full items-center gap-[7px] border-0 bg-transparent px-[10px] py-[7px] text-left text-xs text-danger hover:bg-danger-wash" role="menuitem" onClick={onDelete}><Trash2 size={13} />删除连接</button>
+          </div>
         </>
       )}
     </div>
   )
 }
-

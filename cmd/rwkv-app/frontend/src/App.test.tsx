@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { Clipboard } from '@wailsio/runtime'
 import * as Backend from '../bindings/github.com/no22/RWKV-Agent/cmd/rwkv-app/appservice'
 import { AgentProtocol, AgentPromptPreview, Config, ModelState, Provider, Result, Status } from '../bindings/github.com/no22/RWKV-Agent/api/models'
 import {
@@ -12,10 +13,12 @@ import {
 } from '../bindings/github.com/no22/RWKV-Agent/cmd/rwkv-app/models'
 import { SavedProvider, SubagentStep, SubagentTrace, ToolRetryTrace, ToolTrace } from '../bindings/github.com/no22/RWKV-Agent/internal/appstorage/models'
 import App from './App'
+import { SnackbarProvider } from './snackbar-context'
 
 const eventHandlers = vi.hoisted(() => new Map<string, (event: { data: unknown }) => void>())
 
 vi.mock('@wailsio/runtime', () => ({
+  Clipboard: { SetText: vi.fn().mockResolvedValue(undefined) },
   Events: { On: (name: string, handler: (event: { data: unknown }) => void) => {
     eventHandlers.set(name, handler)
     return () => eventHandlers.delete(name)
@@ -33,6 +36,9 @@ vi.mock('../bindings/github.com/no22/RWKV-Agent/cmd/rwkv-app/appservice', () => 
   Bootstrap: vi.fn(),
   Status: vi.fn().mockResolvedValue({ state: 'idle', workspace: '/tmp/RWKV-Agent', hasApiKey: false, updatedAt: new Date().toISOString() }),
   Chat: vi.fn(),
+  EditMessage: vi.fn(),
+  Regenerate: vi.fn(),
+  SelectBranch: vi.fn(),
   Configure: vi.fn(),
   ConfigureProvider: vi.fn(),
   SaveProvider: vi.fn(),
@@ -137,7 +143,7 @@ function switchToRemoteProvider() {
 
 beforeEach(() => {
   eventHandlers.clear()
-  vi.mocked(Backend.Bootstrap).mockResolvedValue(bootstrap())
+  vi.mocked(Backend.Bootstrap).mockReset().mockResolvedValue(bootstrap())
   vi.mocked(Backend.PreviewSystemPrompt).mockResolvedValue(new AgentPromptPreview({
     control: 'preview-prompt',
     responseControl: '',
@@ -151,6 +157,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  delete (window as typeof window & { _wails?: unknown })._wails
   vi.clearAllMocks()
 })
 
@@ -512,7 +519,9 @@ describe('App', () => {
     render(<App />)
     await waitFor(() => expect(Backend.Bootstrap).toHaveBeenCalledOnce())
     openSettings()
-    fireEvent.click(screen.getByRole('button', { name: '使用' }))
+    expect(screen.queryByRole('button', { name: '使用' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '更多操作 Solo connection' }))
+    fireEvent.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: '使用' }))
 
     await waitFor(() => expect(Backend.ActivateProvider).toHaveBeenCalledOnce())
     expect(vi.mocked(Backend.ActivateProvider).mock.calls[0][0]).toBe('p1')
@@ -635,12 +644,38 @@ describe('App', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'project-b' }))
 
     await waitFor(() => expect(Backend.OpenWorkspace).toHaveBeenCalledWith('/tmp/project-b'))
+    expect(screen.getByText('当前没有可用连接，请先创建连接并点击“保存并使用”。')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '返回对话' })).toBeInTheDocument()
+  })
+
+  it('keeps the conversation open when a workspace retains its connection', async () => {
+    const provider = savedRemoteProvider()
+    const workspaces = [
+      new WorkspaceItem({ path: '/tmp/project-a', name: 'project-a', available: true, active: true }),
+      new WorkspaceItem({ path: '/tmp/project-b', name: 'project-b', available: true, active: false }),
+    ]
+    vi.mocked(Backend.Bootstrap).mockResolvedValue(bootstrap({
+      status: readyStatus(), hasConfig: true, config: provider.config,
+      providers: [provider], activeProviderId: provider.id, runtimeProviderId: provider.id, workspaces,
+    }))
+    vi.mocked(Backend.OpenWorkspace).mockResolvedValue(bootstrap({
+      status: new Status({ ...readyStatus(), workspace: '/tmp/project-b' }),
+      hasConfig: true, config: provider.config,
+      providers: [provider], activeProviderId: provider.id, runtimeProviderId: provider.id,
+      workspaces: workspaces.map((item) => new WorkspaceItem({ ...item, active: item.path === '/tmp/project-b' })),
+    }))
+
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'project-b' }))
+
+    await waitFor(() => expect(Backend.OpenWorkspace).toHaveBeenCalledWith('/tmp/project-b'))
     expect(screen.getAllByText('project-b').length).toBeGreaterThan(0)
+    expect(screen.queryByRole('button', { name: '返回对话' })).not.toBeInTheDocument()
   })
 
   it('reopens a saved conversation and shows subagent cards', async () => {
     const summary = new ConversationSummary({ id: 'conversation-1', title: '检查项目', updatedAt: new Date().toISOString() })
-    vi.mocked(Backend.Bootstrap).mockResolvedValue(bootstrap({ conversations: [summary] }))
+    vi.mocked(Backend.Bootstrap).mockResolvedValue(bootstrap({ status: readyStatus(), conversations: [summary] }))
     vi.mocked(Backend.OpenConversation).mockResolvedValue(new ConversationView({
       id: summary.id,
       title: summary.title,
@@ -698,6 +733,130 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: /spawn_agents/ }))
     fireEvent.click(screen.getByRole('tab', { name: '原文' }))
     expect(screen.getByText(/legacySubagents/)).toHaveTextContent('检查官方文档')
+  })
+
+  it('shows regenerated answers as switchable message branches', async () => {
+    const summary = new ConversationSummary({ id: 'branch-conversation', title: '分支对话', updatedAt: new Date().toISOString() })
+    const messages = [
+      new DisplayMessage({ id: 'm1', role: 'user', content: '解释架构' }),
+      new DisplayMessage({ id: 'm2', parentId: 'm1', role: 'assistant', content: '第一个回答' }),
+      new DisplayMessage({ id: 'm3', parentId: 'm1', role: 'assistant', content: '第二个回答' }),
+    ]
+    vi.mocked(Backend.Bootstrap).mockResolvedValue(bootstrap({ conversations: [summary] }))
+    vi.mocked(Backend.OpenConversation).mockResolvedValue(new ConversationView({
+      id: summary.id, title: summary.title, activeLeafId: 'm3', messages,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }))
+    vi.mocked(Backend.SelectBranch).mockResolvedValue(new ConversationView({
+      id: summary.id, title: summary.title, activeLeafId: 'm2', messages,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }))
+
+    render(<App />)
+    fireEvent.click(await screen.findByTitle('分支对话'))
+
+    expect(await screen.findByText('第二个回答')).toBeInTheDocument()
+    expect(screen.queryByText('第一个回答')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('消息分支')).toHaveTextContent('2 / 2')
+
+    fireEvent.click(screen.getByRole('button', { name: '上一个分支' }))
+    await waitFor(() => expect(Backend.SelectBranch).toHaveBeenCalledWith('m2'))
+    expect(await screen.findByText('第一个回答')).toBeInTheDocument()
+    expect(screen.queryByText('第二个回答')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('消息分支')).toHaveTextContent('1 / 2')
+  })
+
+  it('creates a sibling answer with the branch action', async () => {
+    const messages = [
+      new DisplayMessage({ id: 'm1', role: 'user', content: '解释架构' }),
+      new DisplayMessage({ id: 'm2', parentId: 'm1', role: 'assistant', content: '第一个回答', meta: '2 步 · 1.2 秒' }),
+    ]
+    const conversation = new ConversationView({
+      id: 'branch-action', title: '分支动作', activeLeafId: 'm2', messages,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    })
+    vi.mocked(Backend.Bootstrap).mockResolvedValueOnce(bootstrap({ status: readyStatus(), conversation }))
+    let resolveRegenerate!: (result: Result) => void
+    vi.mocked(Backend.Regenerate).mockReturnValue(new Promise((resolve) => { resolveRegenerate = resolve }) as ReturnType<typeof Backend.Regenerate>)
+    vi.mocked(Backend.Bootstrap).mockResolvedValueOnce(bootstrap({
+      status: readyStatus(),
+      conversation: new ConversationView({
+        ...conversation,
+        activeLeafId: 'm3',
+        messages: [...messages, new DisplayMessage({ id: 'm3', parentId: 'm1', role: 'assistant', content: '第二个回答' })],
+      }),
+    }))
+
+    render(<App />)
+    expect(await screen.findByText('第一个回答')).toBeInTheDocument()
+    const actions = screen.getByTestId('conversation-turn-1').querySelector('.turn-actions')
+    expect(actions).not.toBeNull()
+    expect(within(actions as HTMLElement).getByRole('button', { name: '复制回答' }).querySelector('svg')).not.toBeNull()
+    expect(within(actions as HTMLElement).getByRole('button', { name: '重新生成' }).querySelector('svg')).not.toBeNull()
+    expect(within(actions as HTMLElement).getByText('2 步 · 1.2 秒')).toHaveClass('ml-auto')
+    fireEvent.click(screen.getByRole('button', { name: '重新生成' }))
+    await waitFor(() => expect(Backend.Regenerate).toHaveBeenCalledWith('m2'))
+    expect(screen.getByLabelText('Agent 运行状态')).toHaveTextContent('正在重新生成')
+    const regeneratingButton = screen.getByRole('button', { name: '重新生成' })
+    expect(regeneratingButton).toBeDisabled()
+    expect(regeneratingButton.querySelector('svg')).toHaveClass('spin')
+
+    await act(async () => resolveRegenerate(new Result({ output: '第二个回答', steps: [], durationMs: 1 })))
+    expect(await screen.findByText('第二个回答')).toBeInTheDocument()
+    const branchSwitcher = screen.getByLabelText('消息分支')
+    expect(branchSwitcher).toHaveTextContent('2 / 2')
+    expect(branchSwitcher.parentElement?.firstElementChild).toBe(branchSwitcher)
+    expect(screen.getByRole('button', { name: '重新生成' }).querySelector('svg')).not.toHaveClass('spin')
+  })
+
+  it('copies and edits a user message as a switchable branch', async () => {
+    Object.defineProperty(window, '_wails', { configurable: true, value: {} })
+    const messages = [
+      new DisplayMessage({ id: 'm1', role: 'user', content: '解释旧架构' }),
+      new DisplayMessage({ id: 'm2', parentId: 'm1', role: 'assistant', content: '旧回答' }),
+    ]
+    const conversation = new ConversationView({
+      id: 'edit-message', title: '编辑消息', activeLeafId: 'm2', messages,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    })
+    const editedMessages = [
+      ...messages,
+      new DisplayMessage({ id: 'm3', role: 'user', content: '解释新架构' }),
+      new DisplayMessage({ id: 'm4', parentId: 'm3', role: 'assistant', content: '新回答' }),
+    ]
+    const editedConversation = new ConversationView({ ...conversation, activeLeafId: 'm4', messages: editedMessages })
+    vi.mocked(Backend.Bootstrap).mockResolvedValueOnce(bootstrap({ status: readyStatus(), conversation }))
+    let resolveEdit!: (result: Result) => void
+    vi.mocked(Backend.EditMessage).mockReturnValue(new Promise((resolve) => { resolveEdit = resolve }) as ReturnType<typeof Backend.EditMessage>)
+    vi.mocked(Backend.Bootstrap).mockResolvedValueOnce(bootstrap({ status: readyStatus(), conversation: editedConversation }))
+    vi.mocked(Backend.SelectBranch).mockResolvedValue(new ConversationView({ ...conversation, messages: editedMessages }))
+
+    render(<SnackbarProvider><App /></SnackbarProvider>)
+    const turn = await screen.findByTestId('conversation-turn-1')
+    fireEvent.click(within(turn).getByRole('button', { name: '复制用户消息' }))
+    await waitFor(() => expect(Clipboard.SetText).toHaveBeenCalledWith('解释旧架构'))
+    expect(await screen.findByRole('status')).toHaveTextContent('已复制')
+
+    fireEvent.click(within(turn).getByRole('button', { name: '编辑用户消息' }))
+    const editor = within(turn).getByLabelText('编辑用户消息')
+    expect(editor).toHaveValue('解释旧架构')
+    fireEvent.change(editor, { target: { value: '解释新架构' } })
+    fireEvent.click(within(turn).getByRole('button', { name: '发送编辑' }))
+
+    await waitFor(() => expect(Backend.EditMessage).toHaveBeenCalledWith('m1', '解释新架构'))
+    expect(screen.getByText('正在生成编辑后的回答…')).toBeInTheDocument()
+    expect(within(turn).getByRole('button', { name: '发送编辑' })).toBeDisabled()
+
+    await act(async () => resolveEdit(new Result({ output: '新回答', steps: [], durationMs: 1 })))
+    expect(await screen.findByText('解释新架构')).toBeInTheDocument()
+    expect(screen.getByText('新回答')).toBeInTheDocument()
+    const userBranchSwitcher = screen.getByLabelText('用户消息分支')
+    expect(userBranchSwitcher).toHaveTextContent('2 / 2')
+
+    fireEvent.click(screen.getByRole('button', { name: '上一个用户消息分支' }))
+    await waitFor(() => expect(Backend.SelectBranch).toHaveBeenCalledWith('m2'))
+    expect(await screen.findByText('解释旧架构')).toBeInTheDocument()
+    expect(screen.getByLabelText('用户消息分支')).toHaveTextContent('1 / 2')
   })
 
   it('groups live child activity under spawn_agents', async () => {

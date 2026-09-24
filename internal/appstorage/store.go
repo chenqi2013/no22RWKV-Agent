@@ -79,6 +79,7 @@ type State struct {
 
 type DisplayMessage struct {
 	ID         string           `json:"id"`
+	ParentID   string           `json:"parentId,omitempty"`
 	Role       string           `json:"role"`
 	Content    string           `json:"content"`
 	Meta       string           `json:"meta,omitempty"`
@@ -129,16 +130,18 @@ type SubagentTrace struct {
 }
 
 type Conversation struct {
-	SchemaVersion int                            `json:"schemaVersion"`
-	ID            string                         `json:"id"`
-	Workspace     string                         `json:"workspace"`
-	Title         string                         `json:"title"`
-	CreatedAt     time.Time                      `json:"createdAt"`
-	UpdatedAt     time.Time                      `json:"updatedAt"`
+	SchemaVersion int       `json:"schemaVersion"`
+	ID            string    `json:"id"`
+	Workspace     string    `json:"workspace"`
+	Title         string    `json:"title"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 	// PinnedAt marks sidebar-pinned conversations; nil means unpinned.
-	PinnedAt      *time.Time                     `json:"pinnedAt,omitempty"`
-	Messages      []DisplayMessage               `json:"messages"`
-	Transcript    []agentapi.ConversationMessage `json:"transcript"`
+	PinnedAt       *time.Time                                `json:"pinnedAt,omitempty"`
+	Messages       []DisplayMessage                          `json:"messages"`
+	Transcript     []agentapi.ConversationMessage            `json:"transcript"`
+	ActiveLeafID   string                                    `json:"activeLeafId,omitempty"`
+	BranchSegments map[string][]agentapi.ConversationMessage `json:"branchSegments,omitempty"`
 }
 
 type Summary struct {
@@ -468,6 +471,7 @@ func (s *Store) SaveConversation(value Conversation) error {
 	value.SchemaVersion = SchemaVersion
 	value.Workspace = filepath.Clean(value.Workspace)
 	value.Title = cleanTitle(value.Title)
+	normalizeConversation(&value)
 	if value.CreatedAt.IsZero() {
 		value.CreatedAt = time.Now().UTC()
 	}
@@ -486,7 +490,33 @@ func (s *Store) LoadConversation(id string) (Conversation, error) {
 	if value.SchemaVersion != SchemaVersion || value.ID != id {
 		return Conversation{}, fmt.Errorf("invalid conversation document")
 	}
+	normalizeConversation(&value)
 	return value, nil
+}
+
+func normalizeConversation(value *Conversation) {
+	if value.BranchSegments == nil {
+		value.BranchSegments = make(map[string][]agentapi.ConversationMessage)
+	}
+	hasParentIDs := false
+	for _, message := range value.Messages {
+		if message.ParentID != "" {
+			hasParentIDs = true
+			break
+		}
+	}
+	if !hasParentIDs {
+		previousID := ""
+		for index := range value.Messages {
+			if index > 0 {
+				value.Messages[index].ParentID = previousID
+			}
+			previousID = value.Messages[index].ID
+		}
+	}
+	if value.ActiveLeafID == "" && len(value.Messages) > 0 {
+		value.ActiveLeafID = value.Messages[len(value.Messages)-1].ID
+	}
 }
 
 func (s *Store) ListConversations(workspace string) ([]Summary, error) {

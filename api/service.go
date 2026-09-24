@@ -35,17 +35,9 @@ type Service struct {
 // valid "no project open" state: the agent is created without file tools and
 // must ask the user to open a workspace before touching local files.
 func NewService(options Options) (*Service, error) {
-	workspace := strings.TrimSpace(options.Workspace)
-	if workspace != "" {
-		absolute, err := filepath.Abs(workspace)
-		if err != nil {
-			return nil, fmt.Errorf("resolve workspace: %w", err)
-		}
-		resolved, err := filepath.EvalSymlinks(absolute)
-		if err != nil {
-			return nil, fmt.Errorf("resolve workspace symlinks: %w", err)
-		}
-		workspace = resolved
+	workspace, err := resolveWorkspace(options.Workspace)
+	if err != nil {
+		return nil, err
 	}
 	service := &Service{
 		workspace: workspace,
@@ -58,6 +50,51 @@ func NewService(options Options) (*Service, error) {
 		UpdatedAt: time.Now(),
 	}
 	return service, nil
+}
+
+func resolveWorkspace(workspace string) (string, error) {
+	if strings.TrimSpace(workspace) == "" {
+		return "", nil
+	}
+	absolute, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace: %w", err)
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace symlinks: %w", err)
+	}
+	return resolved, nil
+}
+
+// SetWorkspace changes the project root without unloading the configured
+// provider. Existing sessions are closed because their tool catalogs capture
+// the previous workspace; new sessions are assembled against the new root.
+func (s *Service) SetWorkspace(workspace string) (Status, error) {
+	resolved, err := resolveWorkspace(workspace)
+	if err != nil {
+		return s.Status(), err
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return Status{}, fmt.Errorf("service is closed")
+	}
+	sessions := make([]*Session, 0, len(s.sessions))
+	for session := range s.sessions {
+		sessions = append(sessions, session)
+	}
+	s.sessions = make(map[*Session]struct{})
+	s.workspace = resolved
+	status := cloneStatus(s.status)
+	status.Workspace = resolved
+	status.UpdatedAt = time.Now()
+	s.status = status
+	s.mu.Unlock()
+	for _, session := range sessions {
+		_ = session.Close()
+	}
+	return cloneStatus(status), nil
 }
 
 // Status returns a snapshot that never contains secret values.

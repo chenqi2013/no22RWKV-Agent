@@ -126,6 +126,7 @@ export class ConversationView {
     "id": string;
     "title": string;
     "messages": DisplayMessage[];
+    "activeLeafId"?: string;
     "createdAt": string;
     "updatedAt": string;
 

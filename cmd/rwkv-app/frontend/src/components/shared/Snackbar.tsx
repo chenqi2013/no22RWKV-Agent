@@ -8,7 +8,7 @@ interface Props {
   onClose: () => void;
 }
 
-export default function Snackbar({ message, severity = "info", duration = 4000, onClose }: Props) {
+export default function Snackbar({ message, severity = "info", duration = 1000, onClose }: Props) {
   const [exiting, setExiting] = useState(false);
 
   useEffect(() => {
@@ -28,17 +28,17 @@ export default function Snackbar({ message, severity = "info", duration = 4000, 
 
   return (
     <div
-      className={`fixed bottom-6 left-1/2 z-[1100] flex -translate-x-1/2 items-center gap-3 rounded-none bg-ink px-4 py-3 text-white shadow-[0_10px_30px_rgba(43,39,33,.35)] transition-all duration-200 ${exiting ? "translate-y-2 opacity-0" : "opacity-100"}`}
+      className={`fixed bottom-5 left-1/2 z-[1100] flex -translate-x-1/2 items-center gap-2 rounded-lg bg-ink px-3 py-2 text-white shadow-[0_6px_20px_rgba(43,39,33,.28)] transition-all duration-200 ${exiting ? "translate-y-1 opacity-0" : "opacity-100"}`}
       role="status"
     >
-      <Icon className={`flex-none ${iconClass}`} size={20} />
-      <span className="text-sm leading-5">{message}</span>
+      <Icon className={`flex-none ${iconClass}`} size={16} />
+      <span className="text-xs leading-4">{message}</span>
       <button
-        className="grid h-7 w-7 flex-none place-items-center rounded-none text-white/70 transition-colors hover:bg-white/10 hover:text-white"
+        className="grid h-5 w-5 flex-none place-items-center rounded-full text-white/70 transition-colors hover:bg-white/10 hover:text-white"
         onClick={() => setExiting(true)}
         aria-label="关闭"
       >
-        <X size={18} />
+        <X size={13} />
       </button>
     </div>
   );

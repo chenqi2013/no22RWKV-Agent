@@ -294,6 +294,32 @@ func TestConversationAndWorkspaceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestConversationPreservesRootUserBranches(t *testing.T) {
+	t.Parallel()
+	store := testStore(t)
+	conversation, err := NewConversation(t.TempDir(), "Branched prompt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation.Messages = []DisplayMessage{
+		{ID: "u1", Role: "user", Content: "original"},
+		{ID: "a1", ParentID: "u1", Role: "assistant", Content: "first"},
+		{ID: "u2", Role: "user", Content: "edited"},
+		{ID: "a2", ParentID: "u2", Role: "assistant", Content: "second"},
+	}
+	conversation.ActiveLeafID = "a2"
+	if err := store.SaveConversation(conversation); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.LoadConversation(conversation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Messages[0].ParentID != "" || loaded.Messages[2].ParentID != "" {
+		t.Fatalf("root user branches were rewritten: %+v", loaded.Messages)
+	}
+}
+
 func TestConversationIDCannotEscapeDataDirectory(t *testing.T) {
 	t.Parallel()
 	store := testStore(t)

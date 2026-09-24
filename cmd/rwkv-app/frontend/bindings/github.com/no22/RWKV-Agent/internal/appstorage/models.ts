@@ -11,6 +11,7 @@ import * as api$0 from "../../api/models.js";
 
 export class DisplayMessage {
     "id": string;
+    "parentId"?: string;
     "role": string;
     "content": string;
     "meta"?: string;
@@ -37,14 +38,14 @@ export class DisplayMessage {
      * Creates a new DisplayMessage instance from a string or object.
      */
     static createFrom($$source: any = {}): DisplayMessage {
-        const $$createField4_0 = $$createType1;
-        const $$createField5_0 = $$createType3;
+        const $$createField5_0 = $$createType1;
+        const $$createField6_0 = $$createType3;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("trajectory" in $$parsedSource) {
-            $$parsedSource["trajectory"] = $$createField4_0($$parsedSource["trajectory"]);
+            $$parsedSource["trajectory"] = $$createField5_0($$parsedSource["trajectory"]);
         }
         if ("trace" in $$parsedSource) {
-            $$parsedSource["trace"] = $$createField5_0($$parsedSource["trace"]);
+            $$parsedSource["trace"] = $$createField6_0($$parsedSource["trace"]);
         }
         return new DisplayMessage($$parsedSource as Partial<DisplayMessage>);
     }

@@ -104,8 +104,10 @@ state, and cache locations. It persists:
 
 - the complete model/provider configuration in `settings.json`, including API
   keys, service passwords, web-provider keys, and custom HTTP header values;
-- display messages and the complete committed Harness transcript for each
-  conversation, including tool calls and tool results;
+- the message tree, active branch, and per-branch Harness transcript segments
+  for each conversation, including tool calls and tool results; regenerating an
+  answer or editing a user message creates a sibling branch that can be selected
+  and continued;
 - the last workspace, recent workspaces, and the active conversation for each
   workspace;
 - a dedicated cache directory for application-level disposable data.

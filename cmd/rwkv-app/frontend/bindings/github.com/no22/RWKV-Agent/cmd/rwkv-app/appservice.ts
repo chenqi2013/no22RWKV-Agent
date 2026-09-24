@@ -91,6 +91,16 @@ export function DeleteProvider(id: string): $CancellablePromise<$models.AppBoots
 }
 
 /**
+ * EditMessage creates a sibling user message and generates its answer from
+ * the context immediately before the selected user message.
+ */
+export function EditMessage(userID: string, content: string): $CancellablePromise<api$0.Result> {
+    return $Call.ByID(1419967717, userID, content).then(($result: any) => {
+        return $$createType2($result);
+    });
+}
+
+/**
  * ExportTrajectory shows a native save dialog and writes the given JSONL
  * content to the chosen path. Returns the written path, or "" when the user
  * cancels the dialog.
@@ -128,8 +138,8 @@ export function OpenConversation(id: string): $CancellablePromise<$models.Conver
 }
 
 /**
- * OpenWorkspace switches to an existing directory and unloads the current
- * provider. Persisted model settings remain available for reconnection.
+ * OpenWorkspace switches to an existing directory while retaining the current
+ * provider. Sessions are recreated so their tools use the new workspace.
  */
 export function OpenWorkspace(path: string): $CancellablePromise<$models.AppBootstrap> {
     return $Call.ByID(928350323, path).then(($result: any) => {
@@ -148,6 +158,16 @@ export function PreviewSystemPrompt(config: api$0.Config): $CancellablePromise<a
 }
 
 /**
+ * Regenerate creates a sibling response from the context immediately before
+ * the selected response's user message.
+ */
+export function Regenerate(responseID: string): $CancellablePromise<api$0.Result> {
+    return $Call.ByID(3829194448, responseID).then(($result: any) => {
+        return $$createType2($result);
+    });
+}
+
+/**
  * RenameConversation updates a conversation's display title.
  */
 export function RenameConversation(id: string, title: string): $CancellablePromise<void> {
@@ -160,6 +180,15 @@ export function RenameConversation(id: string, title: string): $CancellablePromi
 export function SaveProvider(id: string, label: string, config: api$0.Config): $CancellablePromise<appstorage$0.SavedProvider> {
     return $Call.ByID(5308806, id, label, config).then(($result: any) => {
         return $$createType7($result);
+    });
+}
+
+/**
+ * SelectBranch makes one stored response the active continuation point.
+ */
+export function SelectBranch(responseID: string): $CancellablePromise<$models.ConversationView> {
+    return $Call.ByID(2360106714, responseID).then(($result: any) => {
+        return $$createType5($result);
     });
 }
 

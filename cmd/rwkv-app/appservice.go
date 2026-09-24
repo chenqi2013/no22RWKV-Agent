@@ -38,11 +38,12 @@ type ConversationSummary struct {
 }
 
 type ConversationView struct {
-	ID        string           `json:"id"`
-	Title     string           `json:"title"`
-	Messages  []DisplayMessage `json:"messages"`
-	CreatedAt time.Time        `json:"createdAt"`
-	UpdatedAt time.Time        `json:"updatedAt"`
+	ID           string           `json:"id"`
+	Title        string           `json:"title"`
+	Messages     []DisplayMessage `json:"messages"`
+	ActiveLeafID string           `json:"activeLeafId,omitempty"`
+	CreatedAt    time.Time        `json:"createdAt"`
+	UpdatedAt    time.Time        `json:"updatedAt"`
 }
 
 type WorkspaceItem struct {
@@ -274,7 +275,194 @@ func (s *AppService) Chat(ctx context.Context, prompt string) (agentapi.Result, 
 	}
 	return result, err
 }
+
+// Regenerate creates a sibling response from the context immediately before
+// the selected response's user message.
+func (s *AppService) Regenerate(ctx context.Context, responseID string) (agentapi.Result, error) {
+	s.operation.Lock()
+	defer s.operation.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return agentapi.Result{}, fmt.Errorf("application service is closed")
+	}
+	active := s.active
+	service := s.service
+	s.mu.Unlock()
+	if active == nil {
+		return agentapi.Result{}, fmt.Errorf("conversation is not active")
+	}
+	response := conversationMessage(active.Messages, responseID)
+	if response == nil || (response.Role != "assistant" && response.Role != "error") {
+		return agentapi.Result{}, fmt.Errorf("response branch was not found")
+	}
+	user := conversationMessage(active.Messages, response.ParentID)
+	if user == nil || user.Role != "user" {
+		return agentapi.Result{}, fmt.Errorf("response branch has no user message")
+	}
+	prefix, err := branchHistoryBeforeUser(*active, *user)
+	if err != nil {
+		return agentapi.Result{}, err
+	}
+	created, err := service.NewSession(ctx)
+	if err != nil {
+		return agentapi.Result{}, err
+	}
+	if len(prefix) > 0 {
+		if err := created.RestoreHistory(prefix); err != nil {
+			_ = created.Close()
+			return agentapi.Result{}, fmt.Errorf("恢复分支上下文失败: %w", err)
+		}
+	}
+	turnStarted := time.Now().UTC()
+	result, runErr := created.RunWithObserver(ctx, user.Content, func(event agentapi.Event) {
+		s.emit("agent:event", event)
+	})
+	role := "assistant"
+	content := result.Output
+	if runErr != nil {
+		result.Error = runErr.Error()
+		role = "error"
+		content = runErr.Error()
+		s.emit("agent:error", runErr.Error())
+	}
+	if persistErr := s.persistResponse(created, user.Content, role, content, result, turnStarted, user.ID); persistErr != nil {
+		_ = created.Close()
+		if runErr != nil {
+			return result, errors.Join(runErr, persistErr)
+		}
+		return result, persistErr
+	}
+	s.mu.Lock()
+	old := s.session
+	s.session = created
+	s.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	return result, runErr
+}
+
+// EditMessage creates a sibling user message and generates its answer from
+// the context immediately before the selected user message.
+func (s *AppService) EditMessage(ctx context.Context, userID string, content string) (agentapi.Result, error) {
+	prompt := strings.TrimSpace(content)
+	if prompt == "" {
+		return agentapi.Result{}, fmt.Errorf("message is required")
+	}
+	s.operation.Lock()
+	defer s.operation.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return agentapi.Result{}, fmt.Errorf("application service is closed")
+	}
+	active := s.active
+	service := s.service
+	s.mu.Unlock()
+	if active == nil {
+		return agentapi.Result{}, fmt.Errorf("conversation is not active")
+	}
+	user := conversationMessage(active.Messages, userID)
+	if user == nil || user.Role != "user" {
+		return agentapi.Result{}, fmt.Errorf("user message was not found")
+	}
+	userParentID := user.ParentID
+	prefix, err := branchHistoryBeforeUser(*active, *user)
+	if err != nil {
+		return agentapi.Result{}, err
+	}
+	created, err := service.NewSession(ctx)
+	if err != nil {
+		return agentapi.Result{}, err
+	}
+	if len(prefix) > 0 {
+		if err := created.RestoreHistory(prefix); err != nil {
+			_ = created.Close()
+			return agentapi.Result{}, fmt.Errorf("恢复分支上下文失败: %w", err)
+		}
+	}
+	turnStarted := time.Now().UTC()
+	result, runErr := created.RunWithObserver(ctx, prompt, func(event agentapi.Event) {
+		s.emit("agent:event", event)
+	})
+	role := "assistant"
+	responseContent := result.Output
+	if runErr != nil {
+		result.Error = runErr.Error()
+		role = "error"
+		responseContent = runErr.Error()
+		s.emit("agent:error", runErr.Error())
+	}
+	editedUser := appstorage.DisplayMessage{
+		ID: messageID(active.ID, len(active.Messages)), ParentID: userParentID, Role: "user",
+		Content: prompt, CreatedAt: turnStarted,
+	}
+	active.Messages = append(active.Messages, editedUser)
+	if persistErr := s.persistResponse(created, prompt, role, responseContent, result, turnStarted, editedUser.ID); persistErr != nil {
+		_ = created.Close()
+		if runErr != nil {
+			return result, errors.Join(runErr, persistErr)
+		}
+		return result, persistErr
+	}
+	s.mu.Lock()
+	old := s.session
+	s.session = created
+	s.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	return result, runErr
+}
+
+// SelectBranch makes one stored response the active continuation point.
+func (s *AppService) SelectBranch(responseID string) (ConversationView, error) {
+	s.operation.Lock()
+	defer s.operation.Unlock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return ConversationView{}, fmt.Errorf("application service is closed")
+	}
+	active := s.active
+	s.mu.Unlock()
+	if active == nil {
+		return ConversationView{}, fmt.Errorf("conversation is not active")
+	}
+	response := conversationMessage(active.Messages, responseID)
+	if response == nil || (response.Role != "assistant" && response.Role != "error") {
+		return ConversationView{}, fmt.Errorf("response branch was not found")
+	}
+	history, err := branchTranscript(*active, responseID)
+	if err != nil {
+		return ConversationView{}, err
+	}
+	active.ActiveLeafID = responseID
+	active.Transcript = append([]agentapi.ConversationMessage(nil), history...)
+	if err := s.storage.SaveConversation(*active); err != nil {
+		return ConversationView{}, fmt.Errorf("保存消息分支失败: %w", err)
+	}
+	saved, err := s.storage.LoadConversation(active.ID)
+	if err != nil {
+		return ConversationView{}, err
+	}
+	s.mu.Lock()
+	old := s.session
+	s.session = nil
+	s.active = &saved
+	s.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	return conversationView(saved), nil
+}
+
 func (s *AppService) persistTurn(session *agentapi.Session, prompt, role, content string, result agentapi.Result, turnStarted time.Time) error {
+	return s.persistResponse(session, prompt, role, content, result, turnStarted, "")
+}
+
+func (s *AppService) persistResponse(session *agentapi.Session, prompt, role, content string, result agentapi.Result, turnStarted time.Time, userID string) error {
 	s.mu.Lock()
 	active := s.active
 	workspace := s.service.Status().Workspace
@@ -286,20 +474,44 @@ func (s *AppService) persistTurn(session *agentapi.Session, prompt, role, conten
 		}
 		active = &created
 	}
-	active.Messages = append(active.Messages,
-		appstorage.DisplayMessage{
-			ID: messageID(active.ID, len(active.Messages)), Role: "user",
+	if active.BranchSegments == nil {
+		active.BranchSegments = make(map[string][]agentapi.ConversationMessage)
+	}
+	if userID == "" {
+		user := appstorage.DisplayMessage{
+			ID: messageID(active.ID, len(active.Messages)), ParentID: active.ActiveLeafID, Role: "user",
 			Content: strings.TrimSpace(prompt), CreatedAt: turnStarted,
-		},
-		appstorage.DisplayMessage{
-			ID: messageID(active.ID, len(active.Messages)+1), Role: role, Content: content,
-			Meta:       fmt.Sprintf("%d 步 · %.1f 秒", len(result.Steps), float64(result.DurationMS)/1000),
-			Trajectory: storedToolTrace(result),
-			Trace:      &result,
-			CreatedAt:  time.Now().UTC(),
-		},
-	)
-	active.Transcript = session.History()
+		}
+		userID = user.ID
+		active.Messages = append(active.Messages, user)
+	}
+	response := appstorage.DisplayMessage{
+		ID: messageID(active.ID, len(active.Messages)), ParentID: userID, Role: role, Content: content,
+		Meta:       fmt.Sprintf("%d 步 · %.1f 秒", len(result.Steps), float64(result.DurationMS)/1000),
+		Trajectory: storedToolTrace(result),
+		Trace:      &result,
+		CreatedAt:  time.Now().UTC(),
+	}
+	active.Messages = append(active.Messages, response)
+	user := conversationMessage(active.Messages, userID)
+	if user == nil {
+		return fmt.Errorf("response branch has no user message")
+	}
+	prefix, err := branchHistoryBeforeUser(*active, *user)
+	if err != nil {
+		return err
+	}
+	var history []agentapi.ConversationMessage
+	if session != nil {
+		history = session.History()
+	}
+	active.ActiveLeafID = response.ID
+	active.Transcript = append([]agentapi.ConversationMessage(nil), history...)
+	segment := history
+	if len(prefix) <= len(history) && reflect.DeepEqual(history[:len(prefix)], prefix) {
+		segment = history[len(prefix):]
+	}
+	active.BranchSegments[response.ID] = append([]agentapi.ConversationMessage(nil), segment...)
 	if err := s.storage.SaveConversation(*active); err != nil {
 		return fmt.Errorf("保存对话失败: %w", err)
 	}
@@ -353,6 +565,7 @@ func (s *AppService) OpenConversation(id string) (ConversationView, error) {
 	if err != nil {
 		return ConversationView{}, err
 	}
+	hydrateLegacyBranchHistory(&value)
 	s.mu.Lock()
 	workspace := s.service.Status().Workspace
 	if !appstorage.SamePath(value.Workspace, workspace) {
@@ -438,8 +651,8 @@ func (s *AppService) ChooseWorkspace() (AppBootstrap, error) {
 	return s.OpenWorkspace(selected)
 }
 
-// OpenWorkspace switches to an existing directory and unloads the current
-// provider. Persisted model settings remain available for reconnection.
+// OpenWorkspace switches to an existing directory while retaining the current
+// provider. Sessions are recreated so their tools use the new workspace.
 func (s *AppService) OpenWorkspace(path string) (AppBootstrap, error) {
 	s.operation.Lock()
 	defer s.operation.Unlock()
@@ -449,30 +662,31 @@ func (s *AppService) OpenWorkspace(path string) (AppBootstrap, error) {
 		return AppBootstrap{}, fmt.Errorf("application service is closed")
 	}
 	s.mu.Unlock()
-	service, err := agentapi.NewService(agentapi.Options{Workspace: path})
+	s.mu.Lock()
+	service := s.service
+	oldSession := s.session
+	oldWorkspace := service.Status().Workspace
+	s.mu.Unlock()
+	status, err := service.SetWorkspace(path)
 	if err != nil {
 		return AppBootstrap{}, err
 	}
-	if _, err := s.storage.RememberWorkspace(service.Status().Workspace); err != nil {
-		_ = service.Close()
+	if _, err := s.storage.RememberWorkspace(status.Workspace); err != nil {
+		_, _ = service.SetWorkspace(oldWorkspace)
+		s.mu.Lock()
+		s.session = nil
+		s.mu.Unlock()
 		return AppBootstrap{}, err
 	}
 	s.mu.Lock()
-	oldService := s.service
-	oldSession := s.session
-	s.service = service
 	s.session = nil
 	s.active = nil
-	s.runtimeProviderID = ""
 	s.mu.Unlock()
 	if oldSession != nil {
 		_ = oldSession.Close()
 	}
-	if oldService != nil {
-		_ = oldService.Close()
-	}
 	s.loadActiveConversation()
-	s.emit("model:status", service.Status())
+	s.emit("model:status", status)
 	return s.bootstrap()
 }
 
@@ -638,6 +852,7 @@ func (s *AppService) loadActiveConversation() {
 	if err != nil || !appstorage.SamePath(value.Workspace, workspace) {
 		return
 	}
+	hydrateLegacyBranchHistory(&value)
 	s.mu.Lock()
 	s.active = &value
 	s.mu.Unlock()
@@ -664,14 +879,109 @@ func conversationView(value appstorage.Conversation) ConversationView {
 	messages := make([]DisplayMessage, 0, len(value.Messages))
 	for _, message := range value.Messages {
 		messages = append(messages, DisplayMessage{
-			ID: message.ID, Role: message.Role, Content: message.Content, Meta: message.Meta,
+			ID: message.ID, ParentID: message.ParentID, Role: message.Role, Content: message.Content, Meta: message.Meta,
 			Trajectory: message.Trajectory, Trace: message.Trace, CreatedAt: message.CreatedAt,
 		})
 	}
 	return ConversationView{
-		ID: value.ID, Title: value.Title, Messages: messages,
+		ID: value.ID, Title: value.Title, Messages: messages, ActiveLeafID: value.ActiveLeafID,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
+}
+
+func conversationMessage(messages []appstorage.DisplayMessage, id string) *appstorage.DisplayMessage {
+	for index := range messages {
+		if messages[index].ID == id {
+			return &messages[index]
+		}
+	}
+	return nil
+}
+
+func branchHistoryBeforeUser(value appstorage.Conversation, user appstorage.DisplayMessage) ([]agentapi.ConversationMessage, error) {
+	if user.ParentID == "" {
+		return nil, nil
+	}
+	return branchTranscript(value, user.ParentID)
+}
+
+func branchTranscript(value appstorage.Conversation, responseID string) ([]agentapi.ConversationMessage, error) {
+	var segments [][]agentapi.ConversationMessage
+	visited := make(map[string]bool)
+	for responseID != "" {
+		if visited[responseID] {
+			return nil, fmt.Errorf("response branch contains a cycle")
+		}
+		visited[responseID] = true
+		response := conversationMessage(value.Messages, responseID)
+		if response == nil || (response.Role != "assistant" && response.Role != "error") {
+			return nil, fmt.Errorf("response branch was not found")
+		}
+		segment, ok := value.BranchSegments[responseID]
+		if !ok {
+			return nil, fmt.Errorf("response branch has no restorable context")
+		}
+		segments = append(segments, segment)
+		user := conversationMessage(value.Messages, response.ParentID)
+		if user == nil || user.Role != "user" {
+			return nil, fmt.Errorf("response branch has no user message")
+		}
+		responseID = user.ParentID
+	}
+	var history []agentapi.ConversationMessage
+	for index := len(segments) - 1; index >= 0; index-- {
+		history = append(history, segments[index]...)
+	}
+	return history, nil
+}
+
+func hydrateLegacyBranchHistory(value *appstorage.Conversation) {
+	if value == nil || len(value.Messages) < 2 || len(value.Transcript) == 0 {
+		return
+	}
+	for index := 1; index < len(value.Messages); index++ {
+		if value.Messages[index].ParentID != value.Messages[index-1].ID {
+			return
+		}
+	}
+	if value.BranchSegments == nil {
+		value.BranchSegments = make(map[string][]agentapi.ConversationMessage)
+	}
+	cursor := 0
+	for index, message := range value.Messages {
+		if message.Role != "assistant" && message.Role != "error" {
+			continue
+		}
+		user := conversationMessage(value.Messages, message.ParentID)
+		if user == nil || user.Role != "user" {
+			continue
+		}
+		userStart := transcriptUserIndex(value.Transcript, cursor, user.Content)
+		if userStart < 0 {
+			continue
+		}
+		end := len(value.Transcript)
+		for next := index + 1; next < len(value.Messages); next++ {
+			if value.Messages[next].Role != "user" {
+				continue
+			}
+			if found := transcriptUserIndex(value.Transcript, userStart+1, value.Messages[next].Content); found >= 0 {
+				end = found
+			}
+			break
+		}
+		value.BranchSegments[message.ID] = append([]agentapi.ConversationMessage(nil), value.Transcript[userStart:end]...)
+		cursor = end
+	}
+}
+
+func transcriptUserIndex(history []agentapi.ConversationMessage, start int, content string) int {
+	for index := max(start, 0); index < len(history); index++ {
+		if history[index].Role == "user" && history[index].Content == content {
+			return index
+		}
+	}
+	return -1
 }
 
 func storedToolTrace(result agentapi.Result) []appstorage.ToolTrace {

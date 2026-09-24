@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -422,6 +424,56 @@ func TestNewServiceEmptyWorkspaceStaysUnset(t *testing.T) {
 	defer service.Close()
 	if service.Status().Workspace != "" {
 		t.Fatalf("workspace = %q, want empty (no project open)", service.Status().Workspace)
+	}
+}
+
+func TestNewServicePreservesTrailingSpaceInWorkspacePath(t *testing.T) {
+	t.Parallel()
+	workspace := filepath.Join(t.TempDir(), "workspace ")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewService(Options{Workspace: workspace})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	resolved, err := filepath.EvalSymlinks(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.Status().Workspace != resolved {
+		t.Fatalf("workspace = %q, want %q", service.Status().Workspace, resolved)
+	}
+}
+
+func TestSetWorkspacePreservesConfiguredProvider(t *testing.T) {
+	t.Parallel()
+	workspaceA := t.TempDir()
+	workspaceB := t.TempDir()
+	service, err := NewService(Options{Workspace: workspaceA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	configured, err := service.Configure(t.Context(), Config{
+		Provider: ProviderRWKVLightningCUDA,
+		Endpoint: "https://example.test",
+		Model:    "rwkv-test",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := service.SetWorkspace(workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(workspaceB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Workspace != resolved || status.State != ModelReady || status.Provider != configured.Provider || status.Model != configured.Model {
+		t.Fatalf("workspace status = %+v, configured = %+v", status, configured)
 	}
 }
 
