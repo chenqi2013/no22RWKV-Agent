@@ -98,6 +98,7 @@ func newAppService(service *agentapi.Service, storage *appstorage.Store) *AppSer
 	if settings, err := storage.LoadSettings(); err != nil {
 		backend.warning = joinWarning(backend.warning, fmt.Sprintf("读取设置失败：%v", err))
 	} else if cfg := settings.Provider; strings.TrimSpace(cfg.Model) != "" {
+		cfg = desktopStreamingConfig(cfg)
 		backend.config = cfg
 		backend.hasConfig = true
 		// 远端配置很轻量（不发网络请求，连通性检查在"测试连接"里），启动时自动连上
@@ -154,6 +155,7 @@ func (s *AppService) ConfigureProvider(ctx context.Context, id string, label str
 }
 
 func (s *AppService) configureProvider(ctx context.Context, id string, label string, config agentapi.Config) (agentapi.Status, error) {
+	config = desktopStreamingConfig(config)
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -187,6 +189,7 @@ func (s *AppService) configureProvider(ctx context.Context, id string, label str
 
 // SaveProvider 只保存编辑草稿，不连接服务，也不替换当前会话使用的 provider。
 func (s *AppService) SaveProvider(id string, label string, config agentapi.Config) (appstorage.SavedProvider, error) {
+	config = desktopStreamingConfig(config)
 	if err := validateProviderDraft(config); err != nil {
 		return appstorage.SavedProvider{}, err
 	}
@@ -205,6 +208,15 @@ func (s *AppService) SaveProvider(id string, label string, config agentapi.Confi
 	}
 	s.mu.Unlock()
 	return saved, nil
+}
+
+func desktopStreamingConfig(config agentapi.Config) agentapi.Config {
+	switch config.Provider {
+	case agentapi.ProviderRWKVLightningPython, agentapi.ProviderRWKVLightningCUDA:
+		enabled := true
+		config.Stream = &enabled
+	}
+	return config
 }
 
 // ListRemoteModels verifies remote connectivity and returns model identifiers.

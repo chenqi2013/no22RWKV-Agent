@@ -427,6 +427,7 @@ func (s *Session) Close() error {
 func publicEvent(event agent.Event) Event {
 	value := Event{
 		Kind:          EventKind(event.Kind),
+		Text:          event.Text,
 		Step:          event.Step,
 		ParentStep:    event.ParentStep,
 		Tool:          event.Tool,

@@ -43,7 +43,7 @@ func TestUnifiedSessionDefaultsToXMLWithoutRouter(t *testing.T) {
 	generator := continuation.GenerateFunc(func(
 		_ context.Context,
 		request continuation.Request,
-		_ continuation.EventSink,
+		sink continuation.EventSink,
 	) (continuation.Result, error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -53,6 +53,13 @@ func TestUnifiedSessionDefaultsToXMLWithoutRouter(t *testing.T) {
 		requests = append(requests, request)
 		output := outputs[0]
 		outputs = outputs[1:]
+		if sink != nil {
+			for _, delta := range []string{output[:len(output)/2], output[len(output)/2:]} {
+				if err := sink(continuation.Event{Kind: continuation.EventTextDelta, Text: delta}); err != nil {
+					return continuation.Result{}, err
+				}
+			}
+		}
 		return continuation.Result{Text: output, FinishReason: continuation.FinishStop}, nil
 	})
 	session, err := newSession(service, generator, io.NopCloser(strings.NewReader("")), workspace, Status{Model: "scripted"})
@@ -86,6 +93,7 @@ func TestUnifiedSessionDefaultsToXMLWithoutRouter(t *testing.T) {
 	}
 	toolStarted := false
 	routeStarted := false
+	streamedFinal := ""
 	for _, event := range events {
 		if event.Kind == EventToolStart && event.Tool == "read_file" {
 			toolStarted = true
@@ -93,8 +101,11 @@ func TestUnifiedSessionDefaultsToXMLWithoutRouter(t *testing.T) {
 		if event.Kind == EventRouteStart {
 			routeStarted = true
 		}
+		if event.Kind == EventModelDelta && event.Step == 2 {
+			streamedFinal += event.Text
+		}
 	}
-	if !toolStarted || routeStarted {
+	if !toolStarted || routeStarted || streamedFinal != firstLine {
 		t.Fatalf("events = %+v", events)
 	}
 }

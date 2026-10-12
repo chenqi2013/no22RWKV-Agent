@@ -34,7 +34,7 @@ type Message = {
   createdAt?: string
 }
 type AgentActivity = {
-  kind: string; step?: number; parentStep?: number; tool?: string; arguments?: string; route?: string
+  kind: string; text?: string; step?: number; parentStep?: number; tool?: string; arguments?: string; route?: string
   bundles?: string[]; subagentIndex?: number; subagentTask?: string; durationMs?: number
   attempt?: number; maxAttempts?: number; statusCode?: number; delayMs?: number; error?: string
 }
@@ -66,6 +66,7 @@ export default function App() {
   const [activeConversationID, setActiveConversationID] = useState('')
   const [activeLeafID, setActiveLeafID] = useState('')
   const [activity, setActivity] = useState<AgentActivity[]>([])
+  const [streamingText, setStreamingText] = useState('')
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
   const [regeneratingResponseID, setRegeneratingResponseID] = useState('')
@@ -76,6 +77,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [theme, setTheme] = useState<ThemeMode>(() => getInitialTheme())
   const messagesEnd = useRef<HTMLDivElement>(null)
+  const streamingActive = useRef(false)
+  const streamingRawText = useRef('')
   const ready = status.state === ModelState.ModelReady
   const manager = useProviderManager({ onStatus: setStatus, ready })
   const { settingsOpen } = manager
@@ -83,11 +86,24 @@ export default function App() {
   useEffect(() => {
     Backend.Bootstrap().then(applyBootstrap).catch((error: unknown) => setStatus(new Status({ ...emptyStatus, state: ModelState.ModelError, message: errorText(error) })))
     const offStatus = Events.On('model:status', (event) => setStatus(Status.createFrom(event.data)))
-    const offAgent = Events.On('agent:event', (event) => setActivity((current) => [...current, event.data as AgentActivity]))
+    const offAgent = Events.On('agent:event', (event) => {
+      const activityEvent = event.data as AgentActivity
+      if (activityEvent.kind !== 'model_delta') setActivity((current) => [...current, activityEvent])
+      if (!streamingActive.current || activityEvent.parentStep || activityEvent.subagentIndex) return
+      if (activityEvent.kind === 'model_start' || activityEvent.kind === 'protocol_retry' || activityEvent.kind === 'tool_start') {
+        streamingRawText.current = ''
+        setStreamingText('')
+        return
+      }
+      if (activityEvent.kind === 'model_delta' && activityEvent.text) {
+        streamingRawText.current += activityEvent.text
+        setStreamingText(presentableStreamText(streamingRawText.current))
+      }
+    })
     return () => { offStatus(); offAgent() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-  useEffect(() => { messagesEnd.current?.scrollIntoView({ block: 'end' }) }, [messages])
+  useEffect(() => { messagesEnd.current?.scrollIntoView({ block: 'end' }) }, [messages, streamingText])
 
   useEffect(() => {
     function onKeyDown(event: globalThis.KeyboardEvent) {
@@ -161,6 +177,7 @@ export default function App() {
     const content = value.trim(); if (!content || busy) return
     if (!ready) { manager.openSettings(); manager.setSettingsMessage('请先选择一个已保存连接，或新建草稿后点击“保存并使用”。'); return }
     const pendingUserID = `pending-${nextMessageID++}`
+    streamingActive.current = true; streamingRawText.current = ''; setStreamingText('')
     setPrompt(''); setActivity([]); setMessages((current) => [...current, { id: pendingUserID, parentId: activeLeafID, role: 'user', content, createdAt: new Date().toISOString() }]); setActiveLeafID(pendingUserID); setBusy(true)
     try {
       const result = await Backend.Chat(content)
@@ -178,11 +195,12 @@ export default function App() {
         setMessages((current) => [...current, { id: `error-${nextMessageID++}`, role: 'error', content: errorText(error) }])
       }
     }
-    finally { setBusy(false) }
+    finally { streamingActive.current = false; streamingRawText.current = ''; setStreamingText(''); setBusy(false) }
   }
   function submitMessage() { void sendMessage(prompt) }
   async function regenerate(responseID: string) {
     if (busy || !ready) return
+    streamingActive.current = true; streamingRawText.current = ''; setStreamingText('')
     setActivity([]); setRegeneratingResponseID(responseID); setBusy(true)
     try {
       await Backend.Regenerate(responseID)
@@ -190,10 +208,11 @@ export default function App() {
     } catch (error) {
       try { const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); applyConversation(persisted.conversation || undefined) }
       catch { manager.setSettingsMessage(errorText(error)) }
-    } finally { setRegeneratingResponseID(''); setBusy(false) }
+    } finally { streamingActive.current = false; streamingRawText.current = ''; setStreamingText(''); setRegeneratingResponseID(''); setBusy(false) }
   }
   async function editMessage(userID: string, content: string) {
     if (busy || !ready || !content.trim()) return
+    streamingActive.current = true; streamingRawText.current = ''; setStreamingText('')
     setActivity([]); setEditingMessageID(userID); setBusy(true)
     try {
       await Backend.EditMessage(userID, content.trim())
@@ -201,7 +220,7 @@ export default function App() {
     } catch (error) {
       try { const persisted = await Backend.Bootstrap(); setConversations(persisted.conversations || []); applyConversation(persisted.conversation || undefined) }
       catch { manager.setSettingsMessage(errorText(error)) }
-    } finally { setEditingMessageID(''); setBusy(false) }
+    } finally { streamingActive.current = false; streamingRawText.current = ''; setStreamingText(''); setEditingMessageID(''); setBusy(false) }
   }
   async function selectBranch(responseID: string) {
     if (busy || responseID === activeLeafID) return
@@ -248,7 +267,7 @@ export default function App() {
             </button>
           </div>
         </header>
-        {activeTab === 'trace' ? <TraceView messages={traceMessages} selected={selectedMessage} onSelect={setSelectedTraceID} onBackToChat={() => setActiveTab('chat')} /> : <ChatView messages={messages} activeLeafID={activeLeafID} activity={activity} busy={busy} regeneratingResponseID={regeneratingResponseID} editingMessageID={editingMessageID} ready={ready} workspace={workspaceName} model={status.model || '选择模型'} capabilities={capabilities} prompt={prompt} setPrompt={setPrompt} onSubmit={submitMessage} onEditMessage={editMessage} onRegenerate={regenerate} onSelectBranch={selectBranch} onKeyDown={onComposerKeyDown} openSettings={manager.openSettings} chooseWorkspace={chooseWorkspace} onTrace={(id) => { setSelectedTraceID(id); setActiveTab('trace') }} messagesEnd={messagesEnd} />}
+        {activeTab === 'trace' ? <TraceView messages={traceMessages} selected={selectedMessage} onSelect={setSelectedTraceID} onBackToChat={() => setActiveTab('chat')} /> : <ChatView messages={messages} activeLeafID={activeLeafID} activity={activity} streamingText={streamingText} busy={busy} regeneratingResponseID={regeneratingResponseID} editingMessageID={editingMessageID} ready={ready} workspace={workspaceName} model={status.model || '选择模型'} capabilities={capabilities} prompt={prompt} setPrompt={setPrompt} onSubmit={submitMessage} onEditMessage={editMessage} onRegenerate={regenerate} onSelectBranch={selectBranch} onKeyDown={onComposerKeyDown} openSettings={manager.openSettings} chooseWorkspace={chooseWorkspace} onTrace={(id) => { setSelectedTraceID(id); setActiveTab('trace') }} messagesEnd={messagesEnd} />}
       </main>
       <RunConfigDropdown open={runConfigOpen} onClose={() => setRunConfigOpen(false)} ready={ready} busy={busy} providers={manager.providers} runtimeProviderId={manager.runtimeProviderId} onActivate={(id) => void activateProviderNow(id)} onOpenSettings={() => { setRunConfigOpen(false); manager.openSettings() }} />
     </>}
@@ -327,7 +346,7 @@ function Sidebar({ conversations, workspaces, activeId, busy, open, onCloseSideb
   </>
 }
 
-function ChatView({ messages, activeLeafID, activity, busy, regeneratingResponseID, editingMessageID, ready, workspace, capabilities, prompt, setPrompt, onSubmit, onEditMessage, onRegenerate, onSelectBranch, onKeyDown, onTrace, messagesEnd }: { messages: Message[]; activeLeafID: string; activity: AgentActivity[]; busy: boolean; regeneratingResponseID: string; editingMessageID: string; ready: boolean; workspace: string; model: string; capabilities: string; prompt: string; setPrompt: (value: string) => void; onSubmit: () => void; onEditMessage: (userID: string, content: string) => void; onRegenerate: (responseID: string) => void; onSelectBranch: (responseID: string) => void; onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void; openSettings: () => void; chooseWorkspace: () => Promise<void>; onTrace: (id: string) => void; messagesEnd: React.RefObject<HTMLDivElement | null> }) {
+function ChatView({ messages, activeLeafID, activity, streamingText, busy, regeneratingResponseID, editingMessageID, ready, workspace, capabilities, prompt, setPrompt, onSubmit, onEditMessage, onRegenerate, onSelectBranch, onKeyDown, onTrace, messagesEnd }: { messages: Message[]; activeLeafID: string; activity: AgentActivity[]; streamingText: string; busy: boolean; regeneratingResponseID: string; editingMessageID: string; ready: boolean; workspace: string; model: string; capabilities: string; prompt: string; setPrompt: (value: string) => void; onSubmit: () => void; onEditMessage: (userID: string, content: string) => void; onRegenerate: (responseID: string) => void; onSelectBranch: (responseID: string) => void; onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void; openSettings: () => void; chooseWorkspace: () => Promise<void>; onTrace: (id: string) => void; messagesEnd: React.RefObject<HTMLDivElement | null> }) {
   const turns = groupMessagesIntoTurns(activeMessagePath(messages, activeLeafID), messages)
   const empty = turns.length === 0
   const stageRef = useRef<HTMLDivElement>(null)
@@ -380,9 +399,11 @@ function ChatView({ messages, activeLeafID, activity, busy, regeneratingResponse
 
   return <div className="chat-panel relative flex min-h-0 flex-1 flex-col overflow-hidden">
     <div ref={stageRef} className="chat-stage relative min-h-0 flex-1 overflow-hidden">
-      {!empty && <div ref={scrollRef} className="conversation-scroll absolute inset-0 mx-auto content-narrow overflow-auto pt-[30px]">
-        {turns.map((turn, index) => <TurnView key={turn.user?.id || turn.response?.id || index} turn={turn} index={index + 1} busy={busy} pending={busy && index === turns.length - 1 && !turn.response} regenerating={turn.response?.id === regeneratingResponseID} editingBranch={turn.user?.id === editingMessageID} activity={activity} onTrace={onTrace} onEditMessage={onEditMessage} onRegenerate={onRegenerate} onSelectBranch={onSelectBranch} />)}
-        <div ref={messagesEnd} />
+      {!empty && <div ref={scrollRef} className="conversation-scroll absolute inset-0 overflow-auto">
+        <div className="conversation-content mx-auto content-narrow pt-[30px]">
+          {turns.map((turn, index) => { const pending = busy && index === turns.length - 1 && !turn.response; const regenerating = turn.response?.id === regeneratingResponseID; const editingBranch = turn.user?.id === editingMessageID; return <TurnView key={turn.user?.id || turn.response?.id || index} turn={turn} index={index + 1} busy={busy} pending={pending} regenerating={regenerating} editingBranch={editingBranch} streamingText={pending || regenerating || editingBranch ? streamingText : ''} activity={activity} onTrace={onTrace} onEditMessage={onEditMessage} onRegenerate={onRegenerate} onSelectBranch={onSelectBranch} /> })}
+          <div ref={messagesEnd} />
+        </div>
       </div>}
     </div>
     <div ref={anchorRef} className="composer-anchor absolute left-0 right-0 z-[2] mx-auto content-narrow will-change-transform transition-transform duration-[420ms] ease-[cubic-bezier(.2,0,0,1)] motion-reduce:transition-none">
@@ -391,7 +412,7 @@ function ChatView({ messages, activeLeafID, activity, busy, regeneratingResponse
   </div>
 }
 
-function TurnView({ turn, index, busy, pending, regenerating, editingBranch, activity, onTrace, onEditMessage, onRegenerate, onSelectBranch }: { turn: ChatTurn; index: number; busy: boolean; pending: boolean; regenerating: boolean; editingBranch: boolean; activity: AgentActivity[]; onTrace: (id: string) => void; onEditMessage: (userID: string, content: string) => void; onRegenerate: (responseID: string) => void; onSelectBranch: (responseID: string) => void }) {
+function TurnView({ turn, index, busy, pending, regenerating, editingBranch, streamingText, activity, onTrace, onEditMessage, onRegenerate, onSelectBranch }: { turn: ChatTurn; index: number; busy: boolean; pending: boolean; regenerating: boolean; editingBranch: boolean; streamingText: string; activity: AgentActivity[]; onTrace: (id: string) => void; onEditMessage: (userID: string, content: string) => void; onRegenerate: (responseID: string) => void; onSelectBranch: (responseID: string) => void }) {
   const [editing, setEditing] = useState(false)
   const [editValue, setEditValue] = useState(turn.user?.content || '')
   const [userActionsOpen, setUserActionsOpen] = useState(false)
@@ -460,10 +481,11 @@ function TurnView({ turn, index, busy, pending, regenerating, editingBranch, act
           <button className="grid h-7 w-7 place-items-center rounded-[3px] border-0 bg-transparent p-0 hover:bg-surface-active hover:text-brand disabled:opacity-40" aria-label="编辑用户消息" title="编辑" disabled={busy} onClick={() => { setEditValue(turn.user?.content || ''); setEditing(true) }}><Pencil size={14} /></button>
         </div>}
       </div>}
-      {pending && <div className="turn-pending-answer min-h-7 pt-[2px]" aria-live="polite"><span className="answer-cursor" /><span className="sr-only">{activityLabel(activity.at(-1))}</span></div>}
-      {response?.role === 'assistant' && <div className="turn-answer font-serif text-md leading-[1.95] text-ink [overflow-wrap:anywhere]"><MarkdownMessage content={response.content} /></div>}
+      {pending && <div className="turn-pending-answer min-h-7 pt-[2px]" aria-live="polite">{streamingText ? <div className="turn-answer font-serif text-md leading-[1.95] text-ink [overflow-wrap:anywhere]"><MarkdownMessage content={streamingText} /><span className="answer-cursor ml-1 inline-block" /></div> : <><span className="answer-cursor" /><span className="sr-only">{activityLabel(activity.at(-1))}</span></>}</div>}
+      {response?.role === 'assistant' && <div className="turn-answer font-serif text-md leading-[1.95] text-ink [overflow-wrap:anywhere]" aria-live={regenerating ? 'polite' : undefined}><MarkdownMessage content={regenerating && streamingText ? streamingText : response.content} />{regenerating && streamingText && <span className="answer-cursor ml-1 inline-block" />}</div>}
       {response?.role === 'error' && <div className="flex items-start gap-2 border-l-2 border-danger bg-danger-wash p-[10px_12px] text-sm leading-[1.65] text-danger"><X size={15} className="mt-[3px] flex-none" /><span>{response.content}</span></div>}
       {editingBranch && <div className="flex items-center gap-2 text-xs text-brand" aria-live="polite"><LoaderCircle size={14} className="spin" /><span>正在生成编辑后的回答…</span></div>}
+      {editingBranch && streamingText && <div className="turn-answer font-serif text-md leading-[1.95] text-ink [overflow-wrap:anywhere]" aria-live="polite"><MarkdownMessage content={streamingText} /><span className="answer-cursor ml-1 inline-block" /></div>}
       {subagentCount > 0 && response && <SubagentCards trajectory={response.trajectory} done={!pending} />}
       {response && <div className="turn-actions flex items-center gap-1 pt-[2px]">
         {responses.length > 1 && <div className="mr-1 flex items-center gap-1 text-xs text-ink-muted" aria-label="消息分支">
@@ -491,6 +513,25 @@ function fallbackCopyText(content: string) {
   const copied = document.execCommand('copy')
   textarea.remove()
   return copied
+}
+
+function presentableStreamText(raw: string) {
+  let value = raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\r/g, '')
+  const closedThink = value.lastIndexOf('</think>')
+  if (closedThink >= 0) value = value.slice(closedThink + '</think>'.length)
+  else {
+    const possibleThink = value.trimStart().toLowerCase()
+    if ('<think>'.startsWith(possibleThink) || possibleThink.startsWith('<think')) return ''
+  }
+  value = value.trimStart().replace(/^<answer>\s*/i, '').replace(/^Assistant:\s*/i, '')
+  const candidate = value.trimStart().toLowerCase()
+  if (candidate.startsWith('{') || ['<tool_call>', '<tool_calls>', '```json'].some((marker) => marker.startsWith(candidate) || candidate.startsWith(marker))) return ''
+  value = value.replace(/\s*<\/answer>\s*$/i, '')
+  const closingAnswer = '</answer>'
+  for (let length = closingAnswer.length - 1; length > 0; length -= 1) {
+    if (value.toLowerCase().endsWith(closingAnswer.slice(0, length))) return value.slice(0, -length)
+  }
+  return value
 }
 
 function Composer({ prompt, setPrompt, busy, ready, workspace, capabilities, empty, onSubmit, onKeyDown }: { prompt: string; setPrompt: (value: string) => void; busy: boolean; ready: boolean; workspace: string; capabilities: string; empty?: boolean; onSubmit: () => void; onKeyDown: (event: KeyboardEvent<HTMLTextAreaElement>) => void }) {

@@ -71,11 +71,12 @@ func TestClientMapsContinuationRequestAndResponse(t *testing.T) {
 		if err := json.Unmarshal(body, &receivedFields); err != nil {
 			t.Error(err)
 		}
-		writer.Header().Set("Content-Type", "application/json")
-		writeJSON(writer, `{
-            "choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}],
-            "usage":{"prompt_tokens":12,"completion_tokens":4}
-        }`)
+		writeSSE(writer,
+			`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"do"}}]}`,
+			`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"ne"}}]}`,
+			`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"chatcmpl-test","object":"chat.completion.chunk","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4}}`,
+		)
 	}))
 	defer server.Close()
 
@@ -104,7 +105,7 @@ func TestClientMapsContinuationRequestAndResponse(t *testing.T) {
 		delta != "done" {
 		t.Fatalf("result = %+v, delta = %q", result, delta)
 	}
-	if received.Model != "other-model" || received.MaxCompletionTokens != 321 || received.Stream ||
+	if received.Model != "other-model" || received.MaxCompletionTokens != 321 || !received.Stream ||
 		len(received.Messages) != 2 || received.Messages[0].Role != "system" ||
 		received.Messages[1].Role != "user" || received.Messages[1].Content == nil ||
 		*received.Messages[1].Content != validRequest().Prompt ||
@@ -695,6 +696,14 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func writeJSON(writer http.ResponseWriter, body string) {
 	writer.Header().Set("Content-Type", "application/json")
 	_, _ = io.WriteString(writer, body)
+}
+
+func writeSSE(writer http.ResponseWriter, chunks ...string) {
+	writer.Header().Set("Content-Type", "text/event-stream")
+	for _, chunk := range chunks {
+		_, _ = io.WriteString(writer, "data: "+chunk+"\n\n")
+	}
+	_, _ = io.WriteString(writer, "data: [DONE]\n\n")
 }
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

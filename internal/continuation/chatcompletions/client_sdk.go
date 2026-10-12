@@ -105,7 +105,7 @@ func (c *Client) Continue(
 	}
 	requestOptions := c.thinkingOption()
 	requestOptions = append(requestOptions, c.samplingOptions(request.Sampling)...)
-	response, err := c.sdk.Chat.Completions.New(ctx, params, requestOptions...)
+	response, _, err := c.complete(ctx, params, sink, requestOptions...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return continuation.Result{FinishReason: continuation.FinishCancelled}, ctx.Err()
@@ -131,12 +131,6 @@ func (c *Client) Continue(
 		Text:         text,
 		FinishReason: finish,
 		Usage:        sdkUsage(response),
-	}
-	if sink != nil && text != "" {
-		if err := sink(continuation.Event{Kind: continuation.EventTextDelta, Text: text}); err != nil {
-			result.FinishReason = continuation.FinishCancelled
-			return result, err
-		}
 	}
 	return result, nil
 }
@@ -195,7 +189,7 @@ func (c *Client) Complete(
 		}
 		params.ParallelToolCalls = openai.Bool(request.ParallelToolCalls)
 	}
-	response, err := c.sdk.Chat.Completions.New(ctx, params, requestOptions...)
+	response, streamedReasoning, err := c.complete(ctx, params, sink, requestOptions...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return toolchat.Result{FinishReason: continuation.FinishCancelled}, ctx.Err()
@@ -233,18 +227,59 @@ func (c *Client) Complete(
 	}
 	result := toolchat.Result{
 		Content:          content,
-		ReasoningContent: reasoningContent(choice.Message),
+		ReasoningContent: firstNonEmpty(streamedReasoning, reasoningContent(choice.Message)),
 		ToolCalls:        calls,
 		FinishReason:     finish,
 		Usage:            sdkUsage(response),
 	}
-	if sink != nil && content != "" {
-		if err := sink(continuation.Event{Kind: continuation.EventTextDelta, Text: content}); err != nil {
-			result.FinishReason = continuation.FinishCancelled
-			return result, err
+	return result, nil
+}
+
+func (c *Client) complete(
+	ctx context.Context,
+	params openai.ChatCompletionNewParams,
+	sink continuation.EventSink,
+	requestOptions ...option.RequestOption,
+) (*openai.ChatCompletion, string, error) {
+	if sink == nil {
+		response, err := c.sdk.Chat.Completions.New(ctx, params, requestOptions...)
+		return response, "", err
+	}
+	params.StreamOptions.IncludeUsage = openai.Bool(true)
+	stream := c.sdk.Chat.Completions.NewStreaming(ctx, params, requestOptions...)
+	defer stream.Close()
+	accumulator := openai.ChatCompletionAccumulator{}
+	var reasoning strings.Builder
+	for stream.Next() {
+		chunk := stream.Current()
+		if !accumulator.AddChunk(chunk) {
+			return nil, reasoning.String(), fmt.Errorf("%w: inconsistent streaming response", ErrRemote)
+		}
+		for _, choice := range chunk.Choices {
+			if choice.Index != 0 {
+				continue
+			}
+			if choice.Delta.Content != "" {
+				if err := sink(continuation.Event{Kind: continuation.EventTextDelta, Text: choice.Delta.Content}); err != nil {
+					return nil, reasoning.String(), err
+				}
+			}
+			for _, name := range []string{"reasoning_content", "reasoning"} {
+				field, ok := choice.Delta.JSON.ExtraFields[name]
+				if !ok {
+					continue
+				}
+				var delta string
+				if json.Unmarshal([]byte(field.Raw()), &delta) == nil {
+					reasoning.WriteString(delta)
+				}
+			}
 		}
 	}
-	return result, nil
+	if err := stream.Err(); err != nil {
+		return nil, reasoning.String(), err
+	}
+	return &accumulator.ChatCompletion, reasoning.String(), nil
 }
 
 func (c *Client) samplingOptions(sampling continuation.Sampling) []option.RequestOption {
@@ -439,6 +474,15 @@ func reasoningContent(message openai.ChatCompletionMessage) string {
 		var result string
 		if err := json.Unmarshal([]byte(field.Raw()), &result); err == nil {
 			return result
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
 		}
 	}
 	return ""

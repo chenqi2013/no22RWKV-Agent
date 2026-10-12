@@ -24,19 +24,18 @@ func TestNativeToolsRunThroughAgentWithOfficialMessageChain(t *testing.T) {
 			return
 		}
 		requests = append(requests, received)
-		writer.Header().Set("Content-Type", "application/json")
 		if len(requests) == 1 {
-			writeJSON(writer, `{
-				"choices":[{"index":0,"message":{"content":null,"reasoning_content":"inspect first","tool_calls":[{
-					"id":"call_native_1","type":"function",
-					"function":{"name":"native_echo","arguments":"{\"value\":\"hello\"}"}
-				}]},"finish_reason":"tool_calls"}]
-			}`)
+			writeSSE(writer,
+				`{"id":"chatcmpl-native","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"inspect first","tool_calls":[{"index":0,"id":"call_native_1","type":"function","function":{"name":"native_echo","arguments":"{\"value\":\"hello\"}"}}]}}]}`,
+				`{"id":"chatcmpl-native","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}`,
+			)
 			return
 		}
-		writeJSON(writer, `{
-			"choices":[{"index":0,"message":{"content":"native answer"},"finish_reason":"stop"}]
-		}`)
+		writeSSE(writer,
+			`{"id":"chatcmpl-answer","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"native "}}]}`,
+			`{"id":"chatcmpl-answer","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"answer"}}]}`,
+			`{"id":"chatcmpl-answer","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		)
 	}))
 	defer server.Close()
 

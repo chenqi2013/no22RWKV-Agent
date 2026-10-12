@@ -399,8 +399,11 @@ func TestEditMessageCreatesSiblingUserBranch(t *testing.T) {
 		if requestCount > 1 {
 			content = "新回答"
 		}
-		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"` + content + `"},"finish_reason":"stop"}]}`))
+		encoded, _ := json.Marshal(content)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":` + string(encoded) + `}}]}` + "\n\n"))
+		_, _ = writer.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"))
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
 	}))
 	defer server.Close()
 

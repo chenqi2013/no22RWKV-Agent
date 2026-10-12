@@ -436,6 +436,12 @@ func (turn *runnerTurn) generateModelStep(step int) (turnModelStep, error) {
 		compiled,
 		turn.messages,
 		turn.activeSpecs,
+		func(event continuation.Event) error {
+			if event.Kind == continuation.EventTextDelta && event.Text != "" {
+				r.observe(Event{Kind: EventModelDelta, Step: step, Text: event.Text}, turn.observer)
+			}
+			return nil
+		},
 	)
 	channel := ChannelText
 	if r.toolCompleter != nil {

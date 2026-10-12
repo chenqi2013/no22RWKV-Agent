@@ -146,7 +146,7 @@ export function useProviderManager({ onStatus, ready }: { onStatus: (status: Sta
       password: remoteProtocol !== 'openai' ? apiKey.trim() || undefined : undefined,
       headers: headerMap, tokenizerPath: undefined,
       chatPromptMode: 'native-chat', chatThinking: 'disabled',
-      stream: remoteProtocol !== 'openai' ? draftBaseConfig.stream ?? false : undefined,
+      stream: remoteProtocol !== 'openai' ? true : undefined,
       rwkvStopTokens: remoteProtocol === 'openai' ? undefined : stops,
       maxSteps: DEFAULT_AGENT_LIMITS.maxSteps, maxTokens: DEFAULT_AGENT_LIMITS.maxTokens,
       ...agentCapabilityConfig(),
@@ -275,7 +275,7 @@ export function useProviderManager({ onStatus, ready }: { onStatus: (status: Sta
       ...draftBaseConfig,
       provider: Provider.ProviderRWKVLightningCUDA,
       model: '', endpoint: '', apiKey: undefined, password: undefined, headers: {},
-      chatPromptMode: 'native-chat', chatThinking: 'disabled', stream: false, rwkvStopTokens: 'eos',
+      chatPromptMode: 'native-chat', chatThinking: 'disabled', stream: true, rwkvStopTokens: 'eos',
       maxSteps: DEFAULT_AGENT_LIMITS.maxSteps, maxTokens: DEFAULT_AGENT_LIMITS.maxTokens,
       ...agentCapabilityConfig(),
     })

@@ -221,7 +221,7 @@ describe('App', () => {
     const config = vi.mocked(Backend.ConfigureProvider).mock.calls[0][2]
     expect(config.provider).toBe('rwkv-lightning-cuda')
     expect(config.rwkvStopTokens).toBe('eos')
-    expect(config.stream).toBe(false)
+    expect(config.stream).toBe(true)
     expect(config.headers).toEqual({ 'CF-Access-Client-Id': 'secret' })
     expect(config.agentProtocol).toBe('xml')
     expect(config.progressiveTools).toBe(false)
@@ -801,6 +801,15 @@ describe('App', () => {
     expect(regeneratingButton).toBeDisabled()
     expect(regeneratingButton.querySelector('svg')).toHaveClass('spin')
 
+    const emit = eventHandlers.get('agent:event')
+    act(() => {
+      emit?.({ data: { kind: 'model_start', step: 1 } })
+      emit?.({ data: { kind: 'model_delta', step: 1, text: '第二个' } })
+    })
+    expect(screen.getByText('第二个')).toBeInTheDocument()
+    act(() => emit?.({ data: { kind: 'model_delta', step: 1, text: '回答' } }))
+    expect(screen.getByText('第二个回答')).toBeInTheDocument()
+
     await act(async () => resolveRegenerate(new Result({ output: '第二个回答', steps: [], durationMs: 1 })))
     expect(await screen.findByText('第二个回答')).toBeInTheDocument()
     const branchSwitcher = screen.getByLabelText('消息分支')
@@ -908,6 +917,43 @@ describe('App', () => {
     await waitFor(() => expect(screen.getByTestId('conversation-turn-1')).not.toHaveClass('pending'))
     expect(screen.getAllByTestId(/conversation-turn-/)).toHaveLength(1)
     expect(screen.getByText('done')).toBeInTheDocument()
+  })
+
+  it('renders top-level model deltas while a new answer is running', async () => {
+    vi.mocked(Backend.Bootstrap).mockResolvedValue(bootstrap({ status: readyStatus() }))
+    let resolveChat!: (result: Result) => void
+    vi.mocked(Backend.Chat).mockReturnValue(new Promise((resolve) => { resolveChat = resolve }) as ReturnType<typeof Backend.Chat>)
+
+    render(<App />)
+    const composer = await screen.findByLabelText('消息')
+    fireEvent.change(composer, { target: { value: '流式回答' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(Backend.Chat).toHaveBeenCalledWith('流式回答'))
+
+    const emit = eventHandlers.get('agent:event')
+    act(() => {
+      emit?.({ data: { kind: 'model_start', step: 1 } })
+      emit?.({ data: { kind: 'model_delta', step: 1, text: '正在' } })
+    })
+    expect(screen.getByText('正在')).toBeInTheDocument()
+    act(() => emit?.({ data: { kind: 'model_delta', step: 1, text: '流式输出' } }))
+    expect(screen.getByText('正在流式输出')).toBeInTheDocument()
+
+    act(() => {
+      emit?.({ data: { kind: 'model_start', step: 2 } })
+      emit?.({ data: { kind: 'model_delta', step: 2, text: '<tool_call>{"name":"read_file"}' } })
+    })
+    expect(screen.queryByText(/tool_call/)).not.toBeInTheDocument()
+
+    act(() => {
+      emit?.({ data: { kind: 'model_start', step: 3 } })
+      emit?.({ data: { kind: 'model_delta', step: 3, text: '最终回答' } })
+    })
+    expect(screen.getByText('最终回答')).toBeInTheDocument()
+
+    await act(async () => resolveChat(new Result({ output: '最终回答', steps: [], durationMs: 1 })))
+    await waitFor(() => expect(screen.getByTestId('conversation-turn-1')).not.toHaveClass('pending'))
+    expect(screen.getByText('最终回答')).toBeInTheDocument()
   })
 
   it('opens the trace ledger inspector and exports JSONL', async () => {

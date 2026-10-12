@@ -125,6 +125,7 @@ type EventKind string
 
 const (
 	EventModelStart    EventKind = "model_start"
+	EventModelDelta    EventKind = "model_delta"
 	EventModelDone     EventKind = "model_done"
 	EventRouteStart    EventKind = "route_start"
 	EventRouteDone     EventKind = "route_done"
@@ -139,6 +140,7 @@ const (
 // Event is a transport-safe Agent loop event.
 type Event struct {
 	Kind          EventKind `json:"kind"`
+	Text          string    `json:"text,omitempty"`
 	Step          int       `json:"step,omitempty"`
 	ParentStep    int       `json:"parentStep,omitempty"`
 	Tool          string    `json:"tool,omitempty"`

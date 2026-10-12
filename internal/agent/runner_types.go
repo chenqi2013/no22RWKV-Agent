@@ -174,6 +174,7 @@ type EventKind string
 
 const (
 	EventModelStart    EventKind = "model_start"
+	EventModelDelta    EventKind = "model_delta"
 	EventModelDone     EventKind = "model_done"
 	EventRouteStart    EventKind = "route_start"
 	EventRouteDone     EventKind = "route_done"
@@ -187,6 +188,7 @@ const (
 
 type Event struct {
 	Kind          EventKind
+	Text          string
 	Step          int
 	ParentStep    int
 	Tool          string
